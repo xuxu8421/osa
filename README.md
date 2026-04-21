@@ -145,7 +145,7 @@ osa-rig/
 
 > 数据目录（运行时才产生、不进 git）：`sessions/` `output/` `export/`。
 
-## 架构关键点（给 reviewer）
+## 架构关键点
 
 - **事件总线驱动**，所有传感器原始数据、姿态变化、鼾声状态、干预决策、
   响应都走 `pipeline/events.py::EventBus`，SessionRecorder 订阅所有事件落盘，
