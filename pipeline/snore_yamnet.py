@@ -104,6 +104,10 @@ class YamnetSnoreDetector:
         self._class_names: list[str] = []
         self._is_snoring = False
         self._last_loud_at = 0.0
+        # Timestamp of the last audio callback (see _on_audio). 0 = stream
+        # never produced audio. Used by metrics() / UI so "open but silent"
+        # is distinguishable from "not opened".
+        self._last_audio_t: float = 0.0
         self._latest = {
             'backend': 'yamnet',
             'snoring_prob': 0.0,
@@ -132,10 +136,11 @@ class YamnetSnoreDetector:
             self._model = hub.load('https://tfhub.dev/google/yamnet/1')
             # Read class map the model ships with.
             class_map_path = self._model.class_map_path().numpy().decode()
+            import csv
             with open(class_map_path, 'r') as f:
-                next(f)  # header
-                self._class_names = [row.split(',')[2].strip()
-                                     for row in f]
+                reader = csv.reader(f)
+                next(reader)  # header
+                self._class_names = [row[2] for row in reader if len(row) >= 3]
             return True
         except Exception as e:
             self.status = 'error'
@@ -153,6 +158,10 @@ class YamnetSnoreDetector:
         m['status'] = self.status
         if self.error:
             m['error'] = self.error
+        m['stream_open'] = self._stream is not None
+        m['last_audio_age_s'] = (
+            (time.time() - self._last_audio_t)
+            if self._last_audio_t > 0 else None)
         return m
 
     def set_thresholds(self, energy_db: float = None,
@@ -179,20 +188,44 @@ class YamnetSnoreDetector:
         if self._stream is not None:
             return
         self._stop_evt.clear()
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.sr,
-                channels=1,
-                dtype='float32',
-                blocksize=int(self.sr * 0.1),
-                device=self.device,
-                callback=self._on_audio,
-            )
-            self._stream.start()
-        except Exception as e:
-            self._stream = None
+        # Defensive open: on macOS the subprocess that enumerates devices
+        # and the main process can disagree on device indices after
+        # Bluetooth mics connect/disconnect. Try the user-selected index
+        # as-is, then after a Pa_Terminate/Pa_Initialize (refresh indices),
+        # and finally fall back to the OS default device.
+        last_err = None
+        attempts = [
+            ('selected', self.device, False),
+            ('selected+reinit', self.device, True),
+            ('os_default', None, False),
+        ]
+        for label, dev, reinit in attempts:
+            if reinit:
+                try:
+                    sd._terminate(); sd._initialize()
+                except Exception:
+                    pass
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.sr,
+                    channels=1,
+                    dtype='float32',
+                    blocksize=int(self.sr * 0.1),
+                    device=dev,
+                    callback=self._on_audio,
+                )
+                self._stream.start()
+                last_err = None
+                if dev is None and self.device is not None:
+                    # Reflect in the runtime so the UI shows OS default.
+                    self.device = None
+                break
+            except Exception as e:
+                self._stream = None
+                last_err = e
+        if last_err is not None:
             self.status = 'error'
-            self.error = f'open input: {e}'
+            self.error = f'open input: {last_err}'
             return
         self.status = 'loading'    # until worker actually loads the model
         self.error = ''
@@ -243,6 +276,10 @@ class YamnetSnoreDetector:
             else:
                 self._ring = np.roll(self._ring, -n)
                 self._ring[-n:] = x
+        # Stamp every audio callback so `last_audio_age` in metrics can tell
+        # the UI "mic stream is open but silent" apart from "stream actually
+        # has callbacks firing".
+        self._last_audio_t = time.time()
 
     # ── worker: run YAMNet every infer_period_s on last 0.96 s ──
 

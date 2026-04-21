@@ -123,6 +123,11 @@ class OsaRuntime:
             'spo2': None, 'pulse': None, 'resp': None,
             'batt_mv': None, 'temp_c': None, 'gesture': None,
         }
+        # HSRG chest band relays SpO2 / PR / PPG from a paired PC-68B oximeter.
+        # Track when we last saw a valid SpO2 / PR so UI can grey out stale
+        # values (e.g. PC-68B off, finger out, out of range).
+        self._spo2_last_t: float = 0.0       # chest-band forwarded
+        self._pulse_last_t: float = 0.0      # chest-band forwarded
         self._chest_buf: list[float] = []
 
         # Rolling multi-channel buffers for trigger snapshots.
@@ -165,15 +170,20 @@ class OsaRuntime:
         # AirPods can flip HFP→A2DP and actually deliver stereo. Default
         # OFF — our preferred setup is Mac built-in mic + AirPods output.
         self.single_earbud_mode: bool = False
-        self.single_earbud_preroll_s: float = 1.2   # AirPods profile switch
-        self.single_earbud_postroll_s: float = 0.3
+        # AirPods Pro actually needs ≈ 2.5 s to release the HFP session and
+        # flip to A2DP — 1.2 s was the old default and caused stereo to
+        # downmix to mono ringtone output. Raise it; still user-tunable.
+        self.single_earbud_preroll_s: float = 2.5
+        self.single_earbud_postroll_s: float = 0.4
 
         self._controller_cfg_values = {
             'trigger_hold_s': 8.0,
+            'retry_trigger_hold_s': 2.0,
+            'retry_reset_idle_s': 30.0,
             'debounce_s': 3.0,
-            'response_window_s': 10.0,
+            'response_window_s': 3.0,
             'cooldown_s': 180.0,
-            'cooldown_no_response_s': 5.0,
+            'cooldown_no_response_s': 1.0,
             'level_db': -15.0,
             'enabled': True,
             'require_snoring': True,
@@ -204,25 +214,71 @@ class OsaRuntime:
 
     # ── single-earbud orchestration ──
 
-    def _audio_before_play(self, req):
-        """If single-earbud mode is on and the mic is running, stop it and
-        wait long enough for AirPods to flip to A2DP."""
+    def _se_duplex_active(self) -> bool:
+        """True iff a real HFP↔A2DP dance is actually needed.
+
+        Heuristic: the mic either (a) shares the same device index as the
+        output, or (b) looks like a Bluetooth device by name. In any other
+        case the mic is a separate physical stream (e.g. Mac built-in mic)
+        and there is no profile conflict to manage — so preroll/postroll
+        would just be a pointless mic blackout.
+        """
         if not self.single_earbud_mode:
+            return False
+        in_dev = self.snore.device
+        out_dev = self.audio_sink.device
+        if in_dev is not None and in_dev == out_dev:
+            return True
+        try:
+            in_name = self._device_name(in_dev, direction='input') or ''
+        except Exception:
+            in_name = ''
+        needles = ('airpods', 'bluetooth', '蓝牙', 'bt')
+        lo = in_name.lower()
+        return any(n in lo for n in needles)
+
+    def _device_name(self, idx, direction: str = 'input') -> Optional[str]:
+        """Resolve a device index to a name via sounddevice (best-effort)."""
+        try:
+            import sounddevice as sd
+            info = sd.query_devices(idx if idx is not None else None)
+            return info.get('name')
+        except Exception:
+            return None
+
+    def _audio_before_play(self, req):
+        """If single-earbud mode is on AND the mic really shares the BT link
+        with the output, stop the mic long enough for AirPods to flip
+        HFP→A2DP. Otherwise no-op (avoids pointless mic blackouts).
+
+        HFP→A2DP on AirPods Pro is NOT automatic. CoreAudio holds the HFP
+        session a while after InputStream.close(), so we:
+
+        1. Stop the mic stream.
+        2. Tear PortAudio down and re-init it. This drops CoreAudio's
+           cached device handles and signals "nothing is holding HFP".
+        3. Sleep preroll_s (default 2.5 s on AirPods Pro, empirically
+           the minimum for reliable flip). User-tunable in the UI.
+        """
+        if not self._se_duplex_active():
+            self._live['_se_was_listening'] = False
             return
         try:
-            if getattr(self.snore, 'status', '') == 'listening':
-                self._live['_se_was_listening'] = True
+            was_listening = getattr(self.snore, 'status', '') == 'listening'
+            self._live['_se_was_listening'] = was_listening
+            if was_listening:
                 self.snore.stop()
-                time.sleep(self.single_earbud_preroll_s)
-            else:
-                self._live['_se_was_listening'] = False
+            try:
+                import sounddevice as sd
+                sd._terminate(); sd._initialize()
+            except Exception:
+                pass
+            time.sleep(self.single_earbud_preroll_s)
         except Exception:
             self._live['_se_was_listening'] = False
 
     def _audio_after_play(self, req):
         """Bring the mic back online after playback is done."""
-        if not self.single_earbud_mode:
-            return
         if not self._live.get('_se_was_listening'):
             return
         try:
@@ -230,6 +286,8 @@ class OsaRuntime:
             self.snore.start()
         except Exception:
             pass
+        finally:
+            self._live['_se_was_listening'] = False
 
     # ────────────────────────────────────────────────────────────── BLE loop
 
@@ -327,10 +385,18 @@ class OsaRuntime:
         self._ble_pkt_count += 1
         v = dp.vitals
         lv = self._ble_latest_vitals
+        now_t = float(ev.t)
         if 70 <= (v.spo2_pct or 0) <= 100:
             lv['spo2'] = v.spo2_pct
+            self._spo2_last_t = now_t
+            # Feed chest-band-forwarded SpO2 into the history buffer that the
+            # trigger-snapshot writer pulls from. Previously only the direct
+            # PC-68B BLE path wrote here; experiments show this relay path is
+            # where SpO2 actually comes from on HSRG-variant chest bands.
+            self._spo2_hist.append((now_t, float(v.spo2_pct)))
         if 30 <= (v.pulse_rate or 0) <= 220:
             lv['pulse'] = v.pulse_rate
+            self._pulse_last_t = now_t
         if 4 <= (v.resp_rate or 0) <= 60:
             lv['resp'] = v.resp_rate
         if v.battery_voltage_mv > 0:
@@ -379,16 +445,41 @@ class OsaRuntime:
 
         sn = self.snore.metrics()
         sess_dur = (time.time() - self.session_start_t) if self.recorder else 0.0
+
+        # SpO2 freshness: values older than 5 s are considered stale (PC-68B
+        # likely off, finger out, or chest band dropped the relay).
+        STALE_S = 5.0
+        now_t = time.time()
+        vitals_out = dict(self._ble_latest_vitals)
+        spo2_age = (now_t - self._spo2_last_t) if self._spo2_last_t > 0 else None
+        pulse_age = (now_t - self._pulse_last_t) if self._pulse_last_t > 0 else None
+        spo2_stale = spo2_age is None or spo2_age > STALE_S
+        pulse_stale = pulse_age is None or pulse_age > STALE_S
+        if spo2_stale:
+            vitals_out['spo2'] = None
+        if pulse_stale:
+            vitals_out['pulse'] = None
+        # If firmware never computes resp_rate (seen on HSRG variant), fall
+        # back to our own peak-based estimate from the chest respiration wave.
+        if vitals_out.get('resp') is None and chest_rr and chest_rr > 0:
+            vitals_out['resp'] = round(float(chest_rr), 1)
+
         return {
-            't': time.time(),
+            't': now_t,
             'chestband': {
                 'state': self._ble_state,
                 'err': self._ble_err,
                 'pkt': self._ble_pkt_count,
-                'vitals': dict(self._ble_latest_vitals),
+                'vitals': vitals_out,
                 'chest_t': chest_t,
                 'chest_y': chest_plot,
                 'chest_rr': chest_rr,
+                # HSRG variant has no own PPG — SpO2/PR/PPG arrive as a
+                # relayed payload from a paired PC-68B oximeter.
+                'spo2_source': 'relay_pc68b',
+                'spo2_stale': bool(spo2_stale),
+                'spo2_age_s': None if spo2_age is None else round(spo2_age, 1),
+                'pulse_stale': bool(pulse_stale),
             },
             'oximeter': {
                 'state': self._oxi_state,
@@ -405,7 +496,12 @@ class OsaRuntime:
             'audio': {
                 'input_device': self.snore.device,
                 'output_device': self.audio_sink.device,
+                'input_name': self._device_name(self.snore.device,
+                                                direction='input'),
+                'output_name': self._device_name(self.audio_sink.device,
+                                                 direction='output'),
                 'single_earbud_mode': self.single_earbud_mode,
+                'single_earbud_active': self._se_duplex_active(),
                 'single_earbud_preroll_s': self.single_earbud_preroll_s,
                 'single_earbud_postroll_s': self.single_earbud_postroll_s,
             },
@@ -470,7 +566,10 @@ class OsaRuntime:
         state = stat.get('state', self._live['ctrl_state'])
         armed_dur = float(stat.get('armed_duration', 0.0))
         cooldown_left = float(stat.get('cooldown_left', 0.0))
-        hold_s = float(cfg['trigger_hold_s'])
+        # Use the *effective* hold (retry or first) so the UI progress bar
+        # fills at the right rate when the controller is retrying.
+        hold_s = float(stat.get('effective_trigger_hold_s',
+                                cfg['trigger_hold_s']))
 
         conds = [
             {'key': 'session',  'label': '会话进行中',
@@ -519,6 +618,12 @@ class OsaRuntime:
             'snore_ok': snore_ok,
             'snore_required': snore_required,
             'session_active': in_session,
+            'retry_mode': bool(stat.get('retry_mode', False)),
+            'first_trigger_hold_s': float(stat.get(
+                'first_trigger_hold_s', cfg['trigger_hold_s'])),
+            'retry_trigger_hold_s': float(stat.get(
+                'retry_trigger_hold_s',
+                cfg.get('retry_trigger_hold_s', 2.0))),
         }
 
     def _oxi_flags(self) -> List[str]:
@@ -775,7 +880,8 @@ class OsaRuntime:
 
     def set_controller_config(self, patch: dict) -> dict:
         v = self._controller_cfg_values
-        for k in ('trigger_hold_s', 'debounce_s', 'response_window_s',
+        for k in ('trigger_hold_s', 'retry_trigger_hold_s',
+                  'retry_reset_idle_s', 'debounce_s', 'response_window_s',
                   'cooldown_s', 'cooldown_no_response_s',
                   'level_db', 'snoring_recent_s'):
             if k in patch:
@@ -798,6 +904,8 @@ class OsaRuntime:
             trigger_postures=('supine',),
             require_snoring=v['require_snoring'],
             trigger_hold_s=v['trigger_hold_s'],
+            retry_trigger_hold_s=v.get('retry_trigger_hold_s', 2.0),
+            retry_reset_idle_s=v.get('retry_reset_idle_s', 30.0),
             snoring_recent_s=v['snoring_recent_s'],
             strategy_pool=('P1', 'P2', 'P3'),
             direction_policy='opposite',

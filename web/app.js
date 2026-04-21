@@ -184,9 +184,17 @@ const App = {
         return { label, kind, text };
       };
       if (!s) return [];
+      const spo2Val = s.chestband?.vitals?.spo2;
+      const spo2Stale = s.chestband?.spo2_stale;
+      let spo2Kind = '', spo2Extra = 'SpO2  —';
+      if (spo2Val != null && !spo2Stale) {
+        spo2Kind = 'ok'; spo2Extra = `SpO2  ${spo2Val}%`;
+      } else if (s.chestband.state === 'connected') {
+        spo2Kind = 'warn'; spo2Extra = 'SpO2  失效 (查 PC-68B)';
+      }
       return [
         mk('胸带', s.chestband.state, s.chestband.pkt ? '#' + s.chestband.pkt : ''),
-        mk('血氧', s.oximeter.state, s.oximeter.pkt ? '#' + s.oximeter.pkt : ''),
+        { label: '', kind: spo2Kind, text: spo2Extra },
         mk('麦克风', s.snore.status === 'listening' ? 'listening' : s.snore.status,
            (s.audio?.input_device != null ? `#${s.audio.input_device}` : 'OS 默认') +
            (s.snore.snoring ? ' · 打鼾中' : '')),
@@ -240,7 +248,8 @@ const App = {
         case 'armed': {
           const held = fmt(c.armed_duration, 1);
           const total = fmt(c.trigger_hold_s || c.config?.trigger_hold_s, 1);
-          return `条件满足中 · 持续 ${held} / ${total} s 将触发播放`;
+          const tag = c.retry_mode ? ' · 重试模式 (快节奏)' : '';
+          return `条件满足中 · 持续 ${held} / ${total} s 将触发播放${tag}`;
         }
         default:
           return c.all_ready
@@ -250,6 +259,13 @@ const App = {
     },
     isConnectedChest() { return this.snap?.chestband?.state === 'connected'; },
     isConnectedOxi()   { return this.snap?.oximeter?.state === 'connected'; },
+    // Map mic RMS dBFS to a 0-100% bar: -80 dB → 0%, -20 dB → 100%.
+    // Gives a visible "alive" signal whenever YAMNet/mic is pulling real audio.
+    micLevelPct() {
+      const db = this.snap?.snore?.energy_db ?? -80;
+      const pct = ((db + 80) / 60) * 100;
+      return Math.max(0, Math.min(100, pct));
+    },
   },
   async mounted() {
     try {
@@ -467,6 +483,13 @@ const App = {
         enabled: on,
       }});
       if (!r.ok) alert('切换失败: ' + (r.err || ''));
+    },
+    async setSingleEarbudTiming(patch) {
+      const r = await api('/api/audio/single-earbud', { method: 'POST', body: {
+        enabled: this.snap?.audio?.single_earbud_mode ?? true,
+        ...patch,
+      }});
+      if (!r.ok) alert('调整失败: ' + (r.err || ''));
     },
 
     // ── experiment ─────────────────────────────────────────
@@ -764,6 +787,58 @@ const App = {
 
     <!-- ====== tab: 实时实验 ====== -->
     <section v-show="tab==='experiment'" class="space-y-6">
+      <!-- Vital signs strip: 4 big tiles on top so you can see
+           SpO2 / 脉率 / 呼吸率 / 姿态 at a glance without digging. -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="card p-4 text-center"
+             :class="{ 'opacity-40': snap?.chestband?.spo2_stale }">
+          <div class="text-xs dim">SpO2</div>
+          <div class="mt-1 text-3xl font-semibold font-mono">
+            <span v-if="snap?.chestband?.vitals?.spo2">
+              {{ snap.chestband.vitals.spo2 }}<span class="text-base dim">%</span>
+            </span>
+            <span v-else class="dim">—</span>
+          </div>
+          <div class="mt-1 text-[10px] dim">
+            {{ snap?.chestband?.spo2_stale
+                ? '失效 (查 PC-68B)'
+                : '来源: PC-68B 转发' }}
+          </div>
+        </div>
+        <div class="card p-4 text-center"
+             :class="{ 'opacity-40': snap?.chestband?.pulse_stale }">
+          <div class="text-xs dim">脉率</div>
+          <div class="mt-1 text-3xl font-semibold font-mono">
+            <span v-if="snap?.chestband?.vitals?.pulse">
+              {{ snap.chestband.vitals.pulse }}<span class="text-base dim"> bpm</span>
+            </span>
+            <span v-else class="dim">—</span>
+          </div>
+          <div class="mt-1 text-[10px] dim">PC-68B 脉搏波</div>
+        </div>
+        <div class="card p-4 text-center">
+          <div class="text-xs dim">呼吸率</div>
+          <div class="mt-1 text-3xl font-semibold font-mono">
+            <span v-if="snap?.chestband?.chest_rr">
+              {{ fmt(snap.chestband.chest_rr, 1) }}<span class="text-base dim"> /min</span>
+            </span>
+            <span v-else class="dim">—</span>
+          </div>
+          <div class="mt-1 text-[10px] dim">胸带 RIP 峰检测</div>
+        </div>
+        <div class="card p-4 text-center">
+          <div class="text-xs dim">姿态</div>
+          <div class="mt-1 text-2xl font-semibold">
+            <span v-if="snap?.posture?.cls && snap.posture.cls !== 'unknown'">
+              {{ posturePretty }}</span>
+            <span v-else class="dim">—</span>
+          </div>
+          <div class="mt-1 text-[10px] dim">
+            胸带 accel · debounce {{ fmt(snap?.controller?.config?.debounce_s, 1) }} s
+          </div>
+        </div>
+      </div>
+
       <div class="grid gap-6 md:grid-cols-2">
         <div class="card p-5">
           <h3 class="text-sky-300 mb-1">当前触发条件 · 仰卧 + 检测到打鼾</h3>
@@ -876,13 +951,26 @@ const App = {
       <div class="card p-5">
         <div class="flex items-center justify-between flex-wrap gap-2">
           <h3 class="text-sky-300">鼾声判决时间线  (近 90 秒)</h3>
-          <div class="text-xs dim" v-if="snap">
-            后端 <span class="kbd">{{ snap.snore_backend }}</span> ·
-            当前概率 {{ fmt(snap.snore?.snoring_prob ?? ((snap.snore?.energy_db ?? -80) + 80) / 60, 2) }} ·
+          <div class="text-xs dim font-mono flex items-center gap-3 flex-wrap" v-if="snap">
+            <span>后端 <span class="kbd">{{ snap.snore_backend }}</span></span>
+            <span>Snore <span class="text-sky-300">{{
+              fmt(snap.snore?.snoring_prob ?? 0, 2) }}</span></span>
+            <span>Breath {{ fmt(snap.snore?.breathing_prob ?? 0, 2) }}</span>
+            <span>Speech {{ fmt(snap.snore?.speech_prob ?? 0, 2) }}</span>
+            <span>top=<span class="text-emerald-300">{{
+              snap.snore?.top_class || '—' }}</span></span>
             <span :class="snap.snore?.snoring ? 'text-emerald-300' : 'dim'">
-              {{ snap.snore?.snoring ? '判为打鼾' : '未触发' }}</span>
-            · 样本 {{ snoreHist.length }}
+              {{ snap.snore?.snoring ? '● 判为打鼾' : '○ 未触发' }}</span>
           </div>
+        </div>
+        <!-- Live mic energy bar: always animating if YAMNet/mic is actually alive. -->
+        <div class="mt-3 flex items-center gap-2 text-xs dim font-mono" v-if="snap">
+          <span class="w-12">麦克</span>
+          <div class="flex-1 h-2 rounded-full bg-slate-800/80 overflow-hidden">
+            <div class="h-full bg-emerald-400 transition-[width] duration-200"
+                 :style="{ width: micLevelPct + '%' }"></div>
+          </div>
+          <span class="w-24 text-right">{{ fmt(snap.snore?.energy_db ?? -80, 1) }} dB</span>
         </div>
         <div class="mt-3 relative">
           <svg v-if="snoreView" :viewBox="'0 0 ' + snoreView.W + ' ' + snoreView.H"
@@ -1007,11 +1095,26 @@ const App = {
           <label class="space-y-1">
             <div class="text-xs dim">响应观察窗 (秒) ·
               播完后盯多久看是否翻身</div>
-            <input type="range" min="3" max="60" step="1"
+            <input type="range" min="1" max="30" step="1"
                    :value="snap.controller.config.response_window_s"
                    @change="applyCtrlCfg({response_window_s: parseFloat($event.target.value)})"
                    class="w-full">
             <div class="text-xs dim">{{ fmt(snap.controller.config.response_window_s, 1) }} s</div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">连发重试武装 (秒) ·
+              无反应后再次蓄力的短时长</div>
+            <input type="range" min="0.5" max="10" step="0.5"
+                   :value="snap.controller.config.retry_trigger_hold_s || 2"
+                   @change="applyCtrlCfg({retry_trigger_hold_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">
+              {{ fmt(snap.controller.config.retry_trigger_hold_s, 1) }} s
+              <span v-if="snap.controller.retry_mode" class="text-amber-300">· 正在使用</span>
+              <span v-else class="dim">
+                · 首触发仍按 {{ fmt(snap.controller.config.trigger_hold_s, 0) }} s 蓄力
+              </span>
+            </div>
           </label>
           <label class="space-y-1">
             <div class="text-xs dim">冷却 · 成功后 (秒)</div>
@@ -1024,7 +1127,7 @@ const App = {
           </label>
           <label class="space-y-1">
             <div class="text-xs dim">冷却 · 无反应后 (秒)</div>
-            <input type="range" min="2" max="60" step="1"
+            <input type="range" min="0.5" max="30" step="0.5"
                    :value="snap.controller.config.cooldown_no_response_s"
                    @change="applyCtrlCfg({cooldown_no_response_s: parseFloat($event.target.value)})"
                    class="w-full">
@@ -1166,10 +1269,12 @@ const App = {
 
     <!-- ====== tab: 设备连接 ====== -->
     <section v-show="tab==='devices'" class="space-y-6">
-      <div class="grid md:grid-cols-2 gap-6">
+      <div class="space-y-6">
         <div class="card p-5">
           <div class="flex items-center justify-between flex-wrap gap-2">
-            <h3 class="text-sky-300">胸带  HSR 1A2.0</h3>
+            <h3 class="text-sky-300">胸带  HSR 1A2.0
+              <span class="text-xs dim font-normal">· 负责呼吸 / 姿态 / 转发 PC-68B SpO2</span>
+            </h3>
             <span v-if="isConnectedChest" class="badge ok">
               <span class="dot"></span>已连接 · 包 #{{ snap.chestband.pkt }}
             </span>
@@ -1210,8 +1315,15 @@ const App = {
               <th>姿态</th><th>体温</th><th>电池</th>
             </tr></thead>
             <tbody><tr>
-              <td>{{ snap.chestband.vitals.spo2 ? snap.chestband.vitals.spo2 + '%' : '—' }}</td>
-              <td>{{ snap.chestband.vitals.pulse ? snap.chestband.vitals.pulse + ' bpm' : '—' }}</td>
+              <td :class="snap.chestband.spo2_stale ? 'dim' : ''">
+                {{ snap.chestband.vitals.spo2
+                   ? snap.chestband.vitals.spo2 + '%'
+                   : (snap.chestband.state === 'connected' ? '失效' : '—') }}
+              </td>
+              <td :class="snap.chestband.pulse_stale ? 'dim' : ''">
+                {{ snap.chestband.vitals.pulse
+                   ? snap.chestband.vitals.pulse + ' bpm' : '—' }}
+              </td>
               <td>{{ snap.chestband.vitals.resp || '—' }}</td>
               <td>{{ posturePretty }}</td>
               <td>{{ snap.chestband.vitals.temp_c != null
@@ -1220,60 +1332,20 @@ const App = {
                      ? snap.chestband.vitals.batt_mv + ' mV' : '—' }}</td>
             </tr></tbody>
           </table>
+          <p class="mt-3 text-xs dim">
+            <b>SpO2 / 脉率来源</b>：手指上夹着的 <b>PC-68B 血氧仪</b>，
+            通过胸带 BLE 转发过来 (同一条连接)。只要 PC-68B 开机就会推送，
+            <u>不用</u>在本程序里单独连它。掉数据一般是手指没夹好 / PC-68B 没电。
+          </p>
         </div>
 
-        <div class="card p-5">
-          <div class="flex items-center justify-between flex-wrap gap-2">
-            <h3 class="text-sky-300">血氧仪  PC-68B  (可选)</h3>
-            <span v-if="isConnectedOxi" class="badge ok">
-              <span class="dot"></span>已连接 · 包 #{{ snap.oximeter.pkt }}
-            </span>
-            <span v-else-if="snap?.oximeter?.state === 'connecting'" class="badge warn">
-              <span class="dot"></span>连接中…
-            </span>
-            <span v-else-if="snap?.oximeter?.state === 'error'" class="badge err">
-              <span class="dot"></span>{{ snap.oximeter.err || '错误' }}
-            </span>
-            <span v-else class="badge"><span class="dot"></span>未连接</span>
-          </div>
-          <div class="mt-4 flex gap-2 items-center flex-wrap">
-            <button class="btn" :disabled="oxiScan.busy" @click="oxiScanGo">
-              {{ oxiScan.busy ? '扫描中…' : '扫描' }}</button>
-            <select v-model="oxiScan.addr" class="flex-1 min-w-[220px]">
-              <option value="">(未选)</option>
-              <option v-for="d in oxiScan.devices" :key="d.address"
-                      :value="d.address">
-                {{ d.rssi }} dBm  {{ d.name }}  [{{ d.address.slice(-8) }}]
-              </option>
-            </select>
-          </div>
-          <div class="mt-2 flex items-center gap-3 text-sm">
-            <label class="flex items-center gap-1">
-              <input type="checkbox" v-model="oxiScan.namedOnly">
-              <span>只显示有名字</span></label>
-            <label class="flex items-center gap-1">
-              <input type="checkbox" v-model="oxiScan.oximeterOnly">
-              <span>仅血氧仪</span></label>
-          </div>
-          <div class="mt-4 flex gap-2">
-            <button class="btn success" @click="oxiConnectGo">连接</button>
-            <button class="btn danger" @click="oxiDisconnectGo">断开</button>
-          </div>
-          <table class="vt mt-5" v-if="snap">
-            <thead><tr>
-              <th>SpO2</th><th>脉率</th><th>灌注 PI</th><th>状态</th>
-            </tr></thead>
-            <tbody><tr>
-              <td>{{ snap.oximeter.vals.spo2 ? snap.oximeter.vals.spo2 + '%' : '—' }}</td>
-              <td>{{ snap.oximeter.vals.pulse ? snap.oximeter.vals.pulse + ' bpm' : '—' }}</td>
-              <td>{{ snap.oximeter.vals.pi != null
-                     ? snap.oximeter.vals.pi.toFixed(1) + ' %' : '—' }}</td>
-              <td>{{ snap.oximeter.flags.length
-                     ? snap.oximeter.flags.join(', ') : '正常' }}</td>
-            </tr></tbody>
-          </table>
-          <p class="mt-3 text-xs dim">BLE 实时 SpO2 受厂商私有协议限制 — 详情见调试 tab。</p>
-        </div>
+        <!--
+          独立 BLE 连 PC-68B 的旧路径已验证为冗余（胸带 HSRG 变体固件
+          会把配对 PC-68B 的 SpO2/PR/PPG 打进 sub-packet 2）。相关后端
+          API 仍保留（oxi_scan / oxi_connect / oxi_disconnect + 调试 tab
+          HEX 面板），但这里不再暴露独立连接卡片，避免两条蓝牙链路互抢。
+          如以后需要把 PC-68B 当外接冗余源，可以把这段 UI 重新启用。
+        -->
       </div>
 
       <div class="card p-5">
@@ -1305,6 +1377,18 @@ const App = {
               <span class="kbd">{{ snap?.snore?.status || '-' }}</span>
               <span v-if="snap?.snore?.error" class="text-rose-300">
                 · {{ snap.snore.error }}</span>
+              <span v-if="snap?.snore"
+                    :class="snap.snore.stream_open ? '' : 'text-rose-300'">
+                · 流 {{ snap.snore.stream_open ? '已打开' : '未开' }}
+              </span>
+              <span v-if="snap?.snore?.last_audio_age_s != null"
+                    :class="snap.snore.last_audio_age_s < 2
+                              ? 'text-emerald-300' : 'text-amber-300'">
+                · 上次回调 {{ fmt(snap.snore.last_audio_age_s, 1) }}s 前
+              </span>
+              <span v-else-if="snap?.snore?.stream_open" class="text-amber-300">
+                · 流开着但从未收到音频 (AirPods 可能卡在 A2DP)
+              </span>
             </div>
           </label>
           <label class="space-y-1">
@@ -1350,15 +1434,53 @@ const App = {
               <div class="font-semibold text-sky-200">单耳机模式 (实验性)</div>
               <div class="text-xs dim mt-1">
                 勾上 = 用 AirPods 同时做收音+放音。
-                每次播放前会关麦克风 ~1.2 s 让耳机从 HFP 切回 A2DP (否则只能出单声道),
-                播完再开回。
-                期间麦克风不采样, 会有 1-2 秒的录音空档;
-                macOS 在切换时也会发一声系统提示音,
-                被试能否接受要你自己试一下。
+                每次播放前会关麦克风 + 重建 PortAudio, 让耳机从 HFP 切回 A2DP
+                (否则只能出单声道), 播完再开回麦克。
+                期间麦克风不采样, 会有 2-3 秒的录音空档;
+                macOS 在切换时可能发一声提示音, 被试能否接受要你自己试一下。
               </div>
               <div v-if="snap?.audio?.single_earbud_mode"
-                   class="mt-2 text-xs text-amber-300">
-                ⓘ 当前已启用。建议先用手动触发按钮试几次, 再用于实验。
+                   class="mt-2 text-xs space-y-1">
+                <div class="text-amber-300">ⓘ 当前已启用。</div>
+                <div v-if="snap.audio.single_earbud_active"
+                     class="text-emerald-300">
+                  ✓ 实际生效 — 输入检测为蓝牙/AirPods, 播放前会切 A2DP, 有 ~{{
+                    fmt(snap.audio.single_earbud_preroll_s, 1)
+                  }} s 麦克风盲区。
+                </div>
+                <div v-else class="dim">
+                  · 当前输入 <b class="text-sky-200">{{
+                    snap.audio.input_name || '(OS 默认)' }}</b>
+                  不经过蓝牙, <u>单耳机模式在此配置下不产生实际效果</u>
+                  — 麦克和扬声器是两条独立通道, 不需要 HFP/A2DP 切换。
+                  想真正体验单耳机双工, 请把"鼾声输入"也切到 AirPods。
+                </div>
+              </div>
+              <div v-if="snap?.audio?.single_earbud_mode"
+                   class="mt-3 grid grid-cols-2 gap-3">
+                <label class="space-y-1">
+                  <div class="dim">preroll · 关麦后等多久再播
+                    <span class="dim">(AirPods Pro ≈ 2.5 s 才切完 A2DP)</span>
+                  </div>
+                  <input type="range" min="0.5" max="5" step="0.1"
+                         :value="snap.audio.single_earbud_preroll_s"
+                         @change="setSingleEarbudTiming({preroll_s: parseFloat($event.target.value)})"
+                         class="w-full">
+                  <div class="dim">{{ fmt(snap.audio.single_earbud_preroll_s, 1) }} s
+                    <span v-if="snap.audio.single_earbud_preroll_s < 2"
+                          class="text-amber-300">
+                      · 太短, 可能仍听到单声道
+                    </span>
+                  </div>
+                </label>
+                <label class="space-y-1">
+                  <div class="dim">postroll · 播完后等多久再开麦</div>
+                  <input type="range" min="0.1" max="2" step="0.1"
+                         :value="snap.audio.single_earbud_postroll_s"
+                         @change="setSingleEarbudTiming({postroll_s: parseFloat($event.target.value)})"
+                         class="w-full">
+                  <div class="dim">{{ fmt(snap.audio.single_earbud_postroll_s, 1) }} s</div>
+                </label>
               </div>
             </div>
           </label>
@@ -1627,9 +1749,11 @@ const App = {
     <!-- ====== tab: 调试 ====== -->
     <section v-show="tab==='debug'" class="space-y-6">
       <div class="card p-5">
-        <h3 class="text-sky-300">血氧仪 · 手动 HEX 命令</h3>
+        <h3 class="text-sky-300">血氧仪 · 手动 HEX 命令  (高级 · 冗余路径)</h3>
         <p class="mt-2 text-sm dim">
-          用于 PC-68B 私有协议的盲试/抓包辅助, 不影响正常实验。
+          <b>仅在需要把 PC-68B 作为独立 BLE 数据源时才用。</b>
+          主实验流程里 SpO2 / PR / PPG 已经由 PC-68B 通过胸带 BLE 转发过来，
+          <u>不需要</u>在这里连它。保留这个面板是为了抓包 / 调试私有协议。
         </p>
         <div class="mt-3 grid md:grid-cols-4 gap-3">
           <select v-model="oxiTarget" class="md:col-span-2">

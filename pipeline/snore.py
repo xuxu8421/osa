@@ -59,6 +59,7 @@ class MicSnoreDetector:
         self._lock = threading.Lock()
         self._is_snoring = False
         self._last_loud_at = 0.0
+        self._last_audio_t: float = 0.0
         self._latest = {
             'energy_db': -120.0,
             'band_ratio': 0.0,
@@ -77,6 +78,10 @@ class MicSnoreDetector:
         m['status'] = self.status
         if self.error:
             m['error'] = self.error
+        m['stream_open'] = self._stream is not None
+        m['last_audio_age_s'] = (
+            (time.time() - self._last_audio_t)
+            if getattr(self, '_last_audio_t', 0.0) > 0 else None)
         return m
 
     def set_thresholds(self, energy_db: float = None,
@@ -92,13 +97,13 @@ class MicSnoreDetector:
         with self._lock:
             return self._ring[-n:].copy()
 
-    def _open_stream(self):
+    def _open_stream(self, device):
         self._stream = sd.InputStream(
             samplerate=self.sr,
             channels=1,
             dtype='float32',
             blocksize=self.frame_n,
-            device=self.device,
+            device=device,
             callback=self._on_audio,
         )
         self._stream.start()
@@ -106,32 +111,39 @@ class MicSnoreDetector:
     def start(self):
         if self._stream is not None:
             return
-        try:
-            self._open_stream()
-        except Exception as e:
-            # PortAudio on macOS wedges into a global error state after a
-            # failed device open (seen with "PaErrorCode -9986"). Tear the
-            # whole host API down and try once more with a fresh init so
-            # users can just pick a working device from the UI and recover
-            # without restarting the whole server.
-            try:
-                if self._stream is not None:
-                    self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-            try:
-                self._open_stream()
-            except Exception as e2:
+        # Three-stage fallback: user's selected device → reinit PortAudio then
+        # retry (device indices diverge between main process and our
+        # enumeration subprocess after BT mics join) → OS default device.
+        last_err = None
+        for attempt, (dev, reinit) in enumerate([
+            (self.device, False),
+            (self.device, True),
+            (None,        False),
+        ]):
+            if reinit:
+                try:
+                    if self._stream is not None:
+                        self._stream.close()
+                except Exception:
+                    pass
                 self._stream = None
-                self.status = 'error'
-                self.error = str(e2)
-                return
+                try:
+                    sd._terminate(); sd._initialize()
+                except Exception:
+                    pass
+            try:
+                self._open_stream(dev)
+                last_err = None
+                if dev is None and self.device is not None:
+                    self.device = None
+                break
+            except Exception as e:
+                self._stream = None
+                last_err = e
+        if last_err is not None:
+            self.status = 'error'
+            self.error = str(last_err)
+            return
         self.status = 'listening'
         self.error = ''
 
@@ -168,6 +180,7 @@ class MicSnoreDetector:
         n = len(x)
         if n == 0:
             return
+        self._last_audio_t = time.time()
         with self._lock:
             # Feature window (short, for FFT)
             if n >= self.window_n:

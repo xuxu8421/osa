@@ -68,6 +68,30 @@
   - battery_voltage_mv
   - device_status
 
+> **⚠️ 实测结论（2026-04-21，HSRG_11003057）**：
+> 这个 "HSRG" 变体固件 **自身没有光学 PPG 模块**。`spo2_pct / pulse_rate /
+> spo2_wave` 三个字段 **完全来自配对的 PC-68B 血氧仪转发**。
+>
+> 三次对照实验（`scripts/_quick_chestband.py`），唯一变量是 PC-68B 是否开机：
+>
+> | 场景 | SpO2 | PR | PPG 波形 |
+> |------|:----:|:--:|:--------:|
+> | 胸带未戴 + PC-68B 关 | 0 | 0 | 0 |
+> | 胸带戴着 + PC-68B 开 (夹手指) | 97% | 85 | 正常波动 |
+> | 胸带戴着 + PC-68B 关 | 0 | 0 | 0 |
+>
+> 推论：
+> 1. PC-68B 只需要 **开机夹手指**，数据就经胸带 BLE 进来，**不需要** 再单独 BLE 连它。
+> 2. finger_out / 电量耗尽 → 这三个字段回到 0。`server/runtime.py` 加了
+>    `spo2_stale` 标记（>5s 无新值置灰）。
+> 3. 如果以后换成**带自己 PPG** 的胸带（不带 HSRG 后缀），行为可能不同，
+>    届时重新跑 `_quick_chestband.py` 对比判断。
+
+> **⚠️ HSRG 固件另外两个"不算"的字段**：
+> - `resp_rate` 永远 0 → 上层用 `_estimate_rr()` 从 `chest_resp` 波形峰检测。
+> - `gesture` 永远 0 → `PostureAnalyzer` 直接用 accel 三轴算姿态。
+> - `battery_voltage_mv` 隔秒 0 / 3865 交替 → `_on_chest_data` 只接受 >0 的新值。
+
 ### sub-packet 3：肺活量计（可选，某些固件才有）
 
 ## 主机侧握手
