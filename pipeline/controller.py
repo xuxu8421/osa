@@ -58,7 +58,16 @@ class ControllerConfig:
     # not yet wired. Set to True once a real SnoringDetector is attached.
     require_snoring: bool = False
     # How long the (posture ∧ snoring-recent) condition must hold before firing
+    # the FIRST intervention after a rest period (builds confidence, resists
+    # false positives).
     trigger_hold_s: float = 8.0
+    # Short hold used for the SECOND-and-subsequent consecutive firings while
+    # the subject is still supine+snoring. Skipping the full 8 s rebuild lets
+    # us keep nudging them at ~8 s intervals instead of ~30 s.
+    # Reset back to the long hold after a successful response, or after
+    # ≥ `retry_reset_idle_s` of no-trigger idle.
+    retry_trigger_hold_s: float = 2.0
+    retry_reset_idle_s: float = 30.0
     # Real snoring has 3-6 s gaps between snores (inhale vs exhale cycles).
     # Instead of requiring `is_snoring()` to be True every instant of the
     # hold period (which would never accumulate), we treat the snoring side
@@ -118,6 +127,12 @@ class ClosedLoopController:
         self._last_strategy: Optional[str] = None
         self._last_direction: Optional[str] = None
         self._last_posture_at_trigger: Optional[str] = None
+        # Retry mode: True while we are in a streak of no-response cooldowns
+        # caused by the same uninterrupted supine+snoring episode. In that
+        # case the next arm uses `retry_trigger_hold_s` instead of the longer
+        # initial `trigger_hold_s`.
+        self._retry_mode: bool = False
+        self._idle_since: float = 0.0
         # Timestamp of the last positive snoring reading (from the detector).
         # Used by `_snoring_ok` to tolerate the gaps between snore events.
         self._last_snore_at: float = 0.0
@@ -149,6 +164,9 @@ class ClosedLoopController:
     def status(self) -> dict:
         snore_age = (time.time() - self._last_snore_at
                      if self._last_snore_at > 0 else float('inf'))
+        effective_hold = (self.cfg.retry_trigger_hold_s
+                          if self._retry_mode
+                          else self.cfg.trigger_hold_s)
         return {
             'state': self.state,
             'enabled': self.cfg.enabled,
@@ -164,6 +182,10 @@ class ClosedLoopController:
             'active_window_start': self.cfg.active_window_start,
             'active_window_end': self.cfg.active_window_end,
             'within_active_window': self._within_active_window(),
+            'retry_mode': bool(self._retry_mode),
+            'effective_trigger_hold_s': float(effective_hold),
+            'first_trigger_hold_s': float(self.cfg.trigger_hold_s),
+            'retry_trigger_hold_s': float(self.cfg.retry_trigger_hold_s),
         }
 
     # ── trigger-condition gating ──
@@ -285,7 +307,13 @@ class ClosedLoopController:
             self._to_idle(reason)
             return
         held = ev.t - self._armed_since
-        if held >= self.cfg.trigger_hold_s:
+        # In retry mode, use the short re-arm hold so we can keep nudging
+        # at ~8 s intervals instead of waiting the full 8 s confidence build
+        # again for every repeat.
+        hold_target = (self.cfg.retry_trigger_hold_s
+                       if self._retry_mode
+                       else self.cfg.trigger_hold_s)
+        if held >= hold_target:
             self._fire(reason='auto_hold')
 
     # ── state transitions ──
@@ -293,13 +321,24 @@ class ClosedLoopController:
     def _arm(self, now: float, posture: str):
         if self.state == 'armed':
             return
+        # Exit retry mode if we've been idle long enough (subject calmed
+        # down on their own). Next arm gets the full confidence hold.
+        if (self._retry_mode and self._idle_since > 0
+                and (now - self._idle_since) >= self.cfg.retry_reset_idle_s):
+            self._retry_mode = False
+        hold_target = (self.cfg.retry_trigger_hold_s
+                       if self._retry_mode
+                       else self.cfg.trigger_hold_s)
         with self._lock:
             self.state = 'armed'
             self._armed_since = now
             self._last_posture_at_trigger = posture
         self.bus.emit('intervention.state',
                       {'state': 'armed', 'posture': posture,
-                       'trigger_hold_s': self.cfg.trigger_hold_s,
+                       'trigger_hold_s': hold_target,
+                       'first_trigger_hold_s': self.cfg.trigger_hold_s,
+                       'retry_trigger_hold_s': self.cfg.retry_trigger_hold_s,
+                       'retry_mode': self._retry_mode,
                        'require_snoring': self.cfg.require_snoring,
                        'snoring_available': self.snoring_provider is not None},
                       src='controller')
@@ -309,6 +348,7 @@ class ClosedLoopController:
             return
         with self._lock:
             self.state = 'idle'
+            self._idle_since = time.time()
         self.bus.emit('intervention.state',
                       {'state': 'idle', 'reason': reason}, src='controller')
 
@@ -412,6 +452,13 @@ class ClosedLoopController:
         with self._lock:
             self.state = 'cooldown'
             self._cooldown_until = now + dur
+            # Retry-mode bookkeeping: stay in retry mode after no_response
+            # / error so the next _arm uses the short hold. Success = the
+            # subject moved → reset to the long confidence hold.
+            if reason == 'response_success':
+                self._retry_mode = False
+            elif reason in ('no_response', 'error'):
+                self._retry_mode = True
         self.bus.emit('intervention.state',
                       {'state': 'cooldown', 'reason': reason,
                        'cooldown_s': dur},

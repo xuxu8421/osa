@@ -7,13 +7,14 @@
 ## 数据流
 
 ```
- ┌──────────────────────────┐
- │  HSR 1A2.0 胸带 (BLE)     │──chestband.data──┐
- │    └ 姿态/呼吸/SpO2/ECG   │                  │
- └──────────────────────────┘                  │
- ┌──────────────────────────┐                  │
- │  PC-68B 血氧仪 (BLE, 可选) │──oximeter.reading┤
- └──────────────────────────┘                  │         ┌───────────────┐
+ ┌────────────────┐  光学 PPG   ┌──────────────────────────┐
+ │ PC-68B 血氧仪   │─ SpO2/PR ─▶│  HSR 1A2.0 胸带 (BLE)     │──chestband.data──┐
+ │  (夹手指开机)    │  转发       │    └ 姿态/呼吸/SpO2/ECG   │                  │
+ └────────────────┘             └──────────────────────────┘                  │
+ ┌──────────────────────────┐                                                 │
+ │  PC-68B 独立 BLE (冗余)    │──oximeter.reading                              │
+ │  (默认关闭, 调试/抓包用)   │       (默认不启动)                              │
+ └──────────────────────────┘                                                 │         ┌───────────────┐
                                                ├────────▶│  EventBus     │
  ┌──────────────────────────┐                  │         │ (发布/订阅)    │
  │  Mac 麦克风 (sounddevice) │──snore.state─────┤         └───────┬───────┘
@@ -75,8 +76,8 @@
 
 | 事件 | 发者 | 常见订阅者 |
 |------|------|-----------|
-| `chestband.data` | `devices/chestband.py` | Recorder, PostureAnalyzer, Runtime(vitals) |
-| `oximeter.reading` | `devices/oximeter.py` | Recorder, Runtime(vitals) |
+| `chestband.data` | `devices/chestband.py` | Recorder, PostureAnalyzer, Runtime(vitals, SpO2 来源主路径) |
+| `oximeter.reading` | `devices/oximeter.py` | Recorder, Runtime（默认不启动；仅独立连 PC-68B 抓包时才有） |
 | `posture.sample` | PostureAnalyzer | Controller, Runtime |
 | `posture.change` | PostureAnalyzer | Controller, Recorder |
 | `snore.state` | `MicSnoreDetector` / `YamnetSnoreDetector` | Runtime(history), Recorder |
