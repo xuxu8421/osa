@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<title>OSA 实验工作台</title>
+<script src="https://cdn.jsdelivr.net/npm/vue@3.5/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink: { 900: '#0b1020', 800: '#111831', 700: '#172041', 600: '#1f2a52' },
+        },
+      },
+    },
+  };
+</script>
+<!-- Load AFTER tailwind CDN so Preflight / forms-plugin can't override us. -->
+<link rel="stylesheet" href="/web/styles.css?v=13">
+</head>
+<body class="bg-ink-900 text-slate-100 antialiased selection:bg-sky-500/30">
+<div id="app"></div>
+<script type="module" src="/web/app.js?v=13"></script>
+</body>
+</html>

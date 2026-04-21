@@ -1,0 +1,227 @@
+:root {
+  color-scheme: dark;
+  --ring: rgba(56, 189, 248, 0.35);
+}
+
+html, body { height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Card */
+.card {
+  background: linear-gradient(180deg, rgba(23,32,65,0.85), rgba(17,24,49,0.85));
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 16px;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset,
+              0 10px 30px rgba(0,0,0,0.35);
+}
+.card h3 {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* Pill badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  border-radius: 9999px;
+  background: rgba(148,163,184,0.08);
+  border: 1px solid rgba(148,163,184,0.16);
+  font-size: 0.8125rem;
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+.badge .dot {
+  width: 0.5rem; height: 0.5rem; border-radius: 50%;
+  background: #64748b;
+}
+.badge.ok   { color: #bbf7d0; background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.35); }
+.badge.ok   .dot { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+.badge.warn { color: #fde68a; background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.35); }
+.badge.warn .dot { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
+.badge.err  { color: #fecaca; background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.35); }
+.badge.err  .dot { background: #ef4444; box-shadow: 0 0 10px #ef4444; }
+
+/* Tabs */
+.tab-btn {
+  padding: 0.625rem 1rem;
+  border-radius: 10px;
+  color: #94a3b8;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease;
+}
+.tab-btn:hover { color: #e2e8f0; background: rgba(148,163,184,0.06); }
+.tab-btn.active {
+  color: #f8fafc;
+  background: rgba(56,189,248,0.12);
+  box-shadow: inset 0 0 0 1px rgba(56,189,248,0.35);
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148,163,184,0.18);
+  background: rgba(148,163,184,0.08);
+  color: #e2e8f0;
+  font-weight: 500;
+  transition: transform 80ms ease, background 120ms ease, border-color 120ms ease;
+}
+.btn:hover { background: rgba(148,163,184,0.16); }
+.btn:active { transform: translateY(1px); }
+.btn.primary {
+  background: linear-gradient(180deg, #0ea5e9, #0284c7);
+  border-color: #0284c7; color: white;
+}
+.btn.primary:hover { background: linear-gradient(180deg, #38bdf8, #0ea5e9); }
+.btn.success {
+  background: linear-gradient(180deg, #22c55e, #16a34a);
+  border-color: #16a34a; color: white;
+}
+.btn.success:hover { background: linear-gradient(180deg, #4ade80, #22c55e); }
+.btn.danger {
+  background: linear-gradient(180deg, #ef4444, #dc2626);
+  border-color: #dc2626; color: white;
+}
+.btn.danger:hover { background: linear-gradient(180deg, #f87171, #ef4444); }
+.btn.warn {
+  background: linear-gradient(180deg, #f59e0b, #d97706);
+  border-color: #d97706; color: #1f2937;
+}
+.btn.warn:hover { background: linear-gradient(180deg, #fbbf24, #f59e0b); }
+.btn.ghost { background: transparent; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Form controls — Tailwind CDN's `forms` plugin paints selects white and
+   loads *after* this stylesheet, so we have to out-specificity / !important
+   to keep the dark theme. */
+input[type="text"], input[type="number"], select, textarea {
+  background-color: rgba(15,23,42,0.9) !important;
+  color: #e2e8f0 !important;
+  border: 1px solid rgba(148,163,184,0.25) !important;
+  border-radius: 10px !important;
+  padding: 0.5rem 0.75rem !important;
+  outline: none;
+}
+select {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  padding-right: 2.2rem !important;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #94a3b8 50%),
+    linear-gradient(135deg, #94a3b8 50%, transparent 50%) !important;
+  background-position:
+    calc(100% - 1.2rem) 50%,
+    calc(100% - 0.75rem) 50% !important;
+  background-size: 6px 6px, 6px 6px !important;
+  background-repeat: no-repeat !important;
+}
+/* The open popup is drawn by the OS on macOS Safari and respects
+   `color-scheme: dark` on :root. Chrome/Edge honour these option rules. */
+select option {
+  background-color: #0f172a !important;
+  color: #e2e8f0 !important;
+}
+select option:checked, select option:hover {
+  background-color: #1e3a8a !important;
+  color: #f8fafc !important;
+}
+input[type="text"]:focus, input[type="number"]:focus,
+select:focus, textarea:focus {
+  border-color: #38bdf8 !important;
+  box-shadow: 0 0 0 3px var(--ring) !important;
+}
+/* Placeholder should be dim, not the plugin's dark-on-dark default. */
+input::placeholder, textarea::placeholder { color: #64748b !important; }
+
+/* Progress */
+.progress {
+  width: 100%;
+  height: 10px;
+  background: rgba(148,163,184,0.14);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+.progress > div {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #4ade80);
+  transition: width 180ms ease;
+}
+.progress.trigger > div {
+  background: linear-gradient(90deg, #38bdf8, #22c55e);
+}
+
+/* Timeline */
+.timeline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  max-height: 22rem;
+  overflow-y: auto;
+  background: rgba(15,23,42,0.45);
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 10px;
+  padding: 0.75rem 0.9rem;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+}
+
+/* Strategy selector buttons */
+.strat-btn {
+  padding: 0.65rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(148,163,184,0.16);
+  background: rgba(15,23,42,0.55);
+  color: #cbd5e1;
+  font-weight: 500;
+  transition: background 120ms ease;
+}
+.strat-btn.active {
+  background: linear-gradient(180deg, #0ea5e9, #0284c7);
+  color: white;
+  border-color: #0284c7;
+}
+.strat-btn:hover:not(.active) { background: rgba(56,189,248,0.08); }
+
+/* Direction L/R chip */
+.dir-chip {
+  padding: 0.45rem 0.85rem;
+  border-radius: 9999px;
+  border: 1px solid rgba(148,163,184,0.2);
+  background: rgba(15,23,42,0.6);
+  color: #cbd5e1;
+}
+.dir-chip.active {
+  background: linear-gradient(180deg, #f59e0b, #d97706);
+  color: #1f2937;
+  border-color: #d97706;
+}
+
+/* Table */
+table.vt { width: 100%; border-collapse: collapse; }
+table.vt th, table.vt td {
+  text-align: left; padding: 0.5rem 0.75rem; font-size: 0.875rem;
+  border-bottom: 1px solid rgba(148,163,184,0.12);
+}
+table.vt th { color: #94a3b8; font-weight: 500; }
+table.vt tr:last-child td { border-bottom: none; }
+
+/* Small helpers */
+.dim { color: #94a3b8; }
+.kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(15,23,42,0.6);
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 6px;
+  padding: 0 0.35rem;
+  font-size: 0.8rem;
+}

@@ -1,4 +1,52 @@
+# OSA rig · what to keep out of git
+# ---------------------------------------------------------------
+# Python byte-code / caches
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env and packaging artifacts
+venv/
+.venv/
+env/
+*.egg-info/
+build/
+# (Our dist/ folder holds remote-user launcher scripts — tracked on purpose,
+# not Python build wheels. It intentionally doesn't appear in this ignore.)
+
+# OS / editor
 .DS_Store
-output/*.wav
+.idea/
+.vscode/
+*.swp
+
+# ---------------------------------------------------------------
+# Experiment data — NEVER commit (privacy + size)
+sessions/
+output/
+export/
+*.npz
+*.wav
+*.mp3
+*.flac
+
+# Local config / secrets
+*.env
+.env
+
+# AI / agent caches
+.agents/
+.claude/
+.trae/
+skills/
+skills-lock.json
+
+# Top-level reference PDFs — keep locally but don't push binaries
+/*.pdf
+
+# Local logs
+*.log
+/tmp/

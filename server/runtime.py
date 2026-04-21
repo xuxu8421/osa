@@ -1,0 +1,1540 @@
+"""
+OsaRuntime — all the non-GUI state/behavior from ui/designer.py extracted
+into a headless class the web server (and anyone else) can drive.
+
+Owns:
+  * EventBus, PostureAnalyzer, MicSnoreDetector, LocalAudioSink
+  * Chest band + oximeter BLE connections (shared background asyncio loop)
+  * Session recorder (optional, per session)
+  * Closed-loop controller (optional, per session)
+  * Rolling buffers for plotting + quick snapshots
+
+Threading notes:
+  * All BLE work runs on a single dedicated asyncio loop in a bg thread.
+  * EventBus callbacks can fire on any thread; handlers only mutate ivars.
+  * Public methods are safe to call from the FastAPI request thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+import soundfile as sf
+
+from devices.chestband import ChestBandBLE
+from devices.chestband_protocol import DataPacket
+from devices.oximeter import OximeterBLE, OxiReading
+
+from pipeline import (
+    EventBus, LocalAudioSink,
+    SessionRecorder, SessionMeta, new_session_id,
+    PostureAnalyzer, ClosedLoopController, ControllerConfig,
+    MicSnoreDetector, YamnetSnoreDetector,
+)
+from pipeline.audio import PlaybackRequest
+from sounds.strategies import (
+    STRATEGY_REGISTRY, synthesize, get_default_params,
+)
+from sounds.generator import DEFAULT_SR
+
+
+ROOT = Path(__file__).resolve().parent.parent
+PRESETS_DIR = ROOT / 'presets'
+OUTPUT_DIR = ROOT / 'output'
+SESSIONS_DIR = ROOT / 'sessions'
+STRATEGY_ORDER = ['P1', 'P2', 'P3', 'L1', 'L2']
+
+
+# Max posture/chest history kept for plotting
+CHEST_BUF_SECS = 30
+CHEST_FS = 25
+CHEST_BUF_MAX = CHEST_FS * CHEST_BUF_SECS
+
+# Long rolling buffers used for "±N seconds around trigger" snapshots.
+# We keep enough history to write out even if the subject crashes through
+# our response_window + no-response cooldown back into another trigger.
+CHEST_SNAPSHOT_BUF_S = 90       # 90 s chest resp waveform (@25 Hz ≈ 2250 pts)
+SPO2_SNAPSHOT_BUF_S = 300       # 5 min SpO2 @ ~1 Hz
+SNORE_SNAPSHOT_BUF_S = 300      # 5 min snoring probability @ 4 Hz
+
+
+def _snore_hint(required: bool, ok: bool, now: bool,
+                age, recent_s: float) -> str:
+    """Build the status-banner hint for the snoring condition."""
+    if not required:
+        return '未要求 require_snoring'
+    if now:
+        return '刚检测到'
+    if ok and age is not None:
+        return f'最近 {age:.1f}s 内有打鼾 (窗口 {recent_s:.0f}s)'
+    if age is None:
+        return '启动后从未检测到打鼾'
+    return f'距上次打鼾 {age:.1f}s (> {recent_s:.0f}s 窗口已过期)'
+
+
+class OsaRuntime:
+    """Singleton runtime for headless operation of the OSA experiment rig."""
+
+    def __init__(self):
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # ── Pipeline core ──
+        self.bus = EventBus()
+        self.audio_sink = LocalAudioSink()
+        self.posture = PostureAnalyzer(self.bus)
+        # Prefer YAMNet (AudioSet-pretrained, includes Snoring class) when
+        # tensorflow is available; fall back to the heuristic detector so
+        # the rest of the stack still works on machines without TF.
+        self.snore_backend = 'heuristic'
+        if YamnetSnoreDetector is not None:
+            try:
+                self.snore = YamnetSnoreDetector(self.bus)
+                self.snore_backend = 'yamnet'
+            except Exception:
+                self.snore = MicSnoreDetector(self.bus)
+        else:
+            self.snore = MicSnoreDetector(self.bus)
+
+        # ── BLE: chest band ──
+        self.ble: Optional[ChestBandBLE] = None
+        self._ble_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ble_loop_started = threading.Event()
+        self._ble_connected = False
+        self._ble_state = 'idle'       # idle | connecting | connected | error
+        self._ble_err = ''
+        self._ble_pkt_count = 0
+        self._ble_scan_busy = False
+        self._ble_devices: list = []   # [(BLEDevice, rssi)]
+        self._ble_latest: Optional[DataPacket] = None
+        self._ble_latest_vitals: dict = {
+            'spo2': None, 'pulse': None, 'resp': None,
+            'batt_mv': None, 'temp_c': None, 'gesture': None,
+        }
+        self._chest_buf: list[float] = []
+
+        # Rolling multi-channel buffers for trigger snapshots.
+        # Each entry is (timestamp_unix, value). deque with maxlen keeps it cheap.
+        from collections import deque
+        self._chest_hist = deque(maxlen=int(CHEST_FS * CHEST_SNAPSHOT_BUF_S))
+        self._spo2_hist = deque(maxlen=int(SPO2_SNAPSHOT_BUF_S * 2))   # ~2 Hz cap
+        self._snore_hist = deque(maxlen=int(SNORE_SNAPSHOT_BUF_S * 6)) # ~6 Hz cap
+
+        # ── BLE: oximeter ──
+        self.oxi: Optional[OximeterBLE] = None
+        self._oxi_connected = False
+        self._oxi_state = 'idle'
+        self._oxi_err = ''
+        self._oxi_pkt_count = 0
+        self._oxi_scan_busy = False
+        self._oxi_devices: list = []
+        self._oxi_latest: Optional[OxiReading] = None
+        self._oxi_latest_vals: dict = {'spo2': None, 'pulse': None, 'pi': None}
+        self._oxi_raw_frames: list[str] = []
+        self._oxi_log_lines: list[str] = []
+        self._oxi_write_uuids: list[str] = []
+
+        # ── Session / controller ──
+        self.recorder: Optional[SessionRecorder] = None
+        self.controller: Optional[ClosedLoopController] = None
+        self.session_start_t: float = 0.0
+
+        # Live mirror of controller/posture state (set by bus handlers)
+        self._live = {
+            'posture': 'unknown',
+            'posture_conf': 0.0,
+            'ctrl_state': 'idle',
+            'ctrl_reason': '',
+            'last_strategy': '',
+            'last_direction': '',
+            'events': [],           # recent event log lines
+        }
+        # Single-earbud duplex mode: close mic briefly before playing so
+        # AirPods can flip HFP→A2DP and actually deliver stereo. Default
+        # OFF — our preferred setup is Mac built-in mic + AirPods output.
+        self.single_earbud_mode: bool = False
+        self.single_earbud_preroll_s: float = 1.2   # AirPods profile switch
+        self.single_earbud_postroll_s: float = 0.3
+
+        self._controller_cfg_values = {
+            'trigger_hold_s': 8.0,
+            'debounce_s': 3.0,
+            'response_window_s': 10.0,
+            'cooldown_s': 180.0,
+            'cooldown_no_response_s': 5.0,
+            'level_db': -15.0,
+            'enabled': True,
+            'require_snoring': True,
+            'snoring_recent_s': 15.0,
+            'active_window_start': '',
+            'active_window_end': '',
+        }
+
+        self.bus.subscribe('posture.sample', self._on_posture_sample)
+        self.bus.subscribe('posture.change', self._on_posture_change)
+        self.bus.subscribe('intervention.state', self._on_ctrl_state)
+        self.bus.subscribe('intervention.triggered', self._on_triggered)
+        self.bus.subscribe('intervention.response', self._on_response)
+        self.bus.subscribe('intervention.error', self._on_intervention_error)
+        self.bus.subscribe('chestband.data', self._on_chest_data)
+        self.bus.subscribe('oximeter.reading', self._on_oxi_reading)
+        self.bus.subscribe('snore.state', self._on_snore_state)
+        self.bus.subscribe('snore.state', self._on_snore_state_event)
+        self._last_error = None  # {msg, t}
+
+        # Wire audio sink hooks for single-earbud mode (no-ops until
+        # single_earbud_mode is turned on).
+        self.audio_sink.before_play = self._audio_before_play
+        self.audio_sink.after_play = self._audio_after_play
+
+        self._start_ble_loop()
+        self.snore.start()
+
+    # ── single-earbud orchestration ──
+
+    def _audio_before_play(self, req):
+        """If single-earbud mode is on and the mic is running, stop it and
+        wait long enough for AirPods to flip to A2DP."""
+        if not self.single_earbud_mode:
+            return
+        try:
+            if getattr(self.snore, 'status', '') == 'listening':
+                self._live['_se_was_listening'] = True
+                self.snore.stop()
+                time.sleep(self.single_earbud_preroll_s)
+            else:
+                self._live['_se_was_listening'] = False
+        except Exception:
+            self._live['_se_was_listening'] = False
+
+    def _audio_after_play(self, req):
+        """Bring the mic back online after playback is done."""
+        if not self.single_earbud_mode:
+            return
+        if not self._live.get('_se_was_listening'):
+            return
+        try:
+            time.sleep(self.single_earbud_postroll_s)
+            self.snore.start()
+        except Exception:
+            pass
+
+    # ────────────────────────────────────────────────────────────── BLE loop
+
+    def _start_ble_loop(self):
+        def _runner():
+            self._ble_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._ble_loop)
+            self._ble_loop_started.set()
+            self._ble_loop.run_forever()
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        self._ble_loop_started.wait(timeout=2.0)
+
+    def _submit(self, coro):
+        if self._ble_loop is None:
+            return None
+        return asyncio.run_coroutine_threadsafe(coro, self._ble_loop)
+
+    # ────────────────────────────────────────────────── Pipeline callbacks
+
+    def _push_event(self, text: str):
+        ev = self._live['events']
+        ev.append(f"[{time.strftime('%H:%M:%S')}]  {text}")
+        if len(ev) > 60:
+            del ev[:-60]
+
+    def _on_posture_sample(self, ev):
+        s = ev.payload
+        self._live['posture'] = s.cls
+        self._live['posture_conf'] = float(s.confidence)
+
+    def _on_posture_change(self, ev):
+        pc = ev.payload
+        self._push_event(
+            f"姿态 {pc.prev} → {pc.cur}  (上一段保持 {pc.prev_duration_s:.1f}s)")
+
+    def _on_ctrl_state(self, ev):
+        p = ev.payload or {}
+        prev = self._live.get('ctrl_state', 'idle')
+        new = p.get('state', prev)
+        self._live['ctrl_state'] = new
+        self._live['ctrl_reason'] = p.get('reason', '')
+        if new != prev:
+            readable = {
+                'idle': '等待中',
+                'armed': '条件满足中 (计时开始)',
+                'triggered': '触发, 合成音频',
+                'playing': '播放干预音',
+                'observe': f"观察期 ({p.get('window_s', '-')} s)",
+                'cooldown': (
+                    f"冷却 ({p.get('cooldown_s', '-')} s · "
+                    f"{p.get('reason','')})")
+            }.get(new, new)
+            self._push_event(f"控制器  {prev} → {new}  · {readable}")
+
+    def _on_snore_state_event(self, ev):
+        """Print a line when the snoring flag flips, so the timeline
+        shows "开始打鼾 / 停止打鼾" even before any trigger fires."""
+        p = ev.payload or {}
+        snoring = bool(p.get('snoring', False))
+        prev = self._live.get('_snore_flag', False)
+        self._live['_snore_flag'] = snoring
+        if snoring != prev:
+            prob = p.get('snoring_prob')
+            prob_s = f" (p={prob:.2f})" if isinstance(prob, (int, float)) else ''
+            self._push_event(
+                f"{'检测到打鼾' if snoring else '打鼾停止'}{prob_s}")
+
+    def _on_triggered(self, ev):
+        p = ev.payload or {}
+        strategy = p.get('strategy', '')
+        direction = p.get('direction', '')
+        self._live['last_strategy'] = strategy
+        self._live['last_direction'] = direction
+        self._push_event(
+            f">> 触发 {strategy}  方向 {direction}  原因 {p.get('reason','')}")
+        self._save_trigger_audio(ev.t, strategy, direction)
+
+    def _on_response(self, ev):
+        p = ev.payload or {}
+        tag = 'OK' if p.get('success') else '--'
+        self._push_event(
+            f"{tag} 响应 {p.get('reason','')}  潜伏 {p.get('latency_s', 0):.1f}s")
+
+    def _on_intervention_error(self, ev):
+        p = ev.payload or {}
+        msg = f"干预播放失败: {p.get('error', '未知')}"
+        self._last_error = {'msg': msg, 't': ev.t}
+        self._push_event(">> " + msg)
+
+    def _on_chest_data(self, ev):
+        dp: DataPacket = ev.payload
+        self._ble_latest = dp
+        self._ble_pkt_count += 1
+        v = dp.vitals
+        lv = self._ble_latest_vitals
+        if 70 <= (v.spo2_pct or 0) <= 100:
+            lv['spo2'] = v.spo2_pct
+        if 30 <= (v.pulse_rate or 0) <= 220:
+            lv['pulse'] = v.pulse_rate
+        if 4 <= (v.resp_rate or 0) <= 60:
+            lv['resp'] = v.resp_rate
+        if v.battery_voltage_mv > 0:
+            lv['batt_mv'] = v.battery_voltage_mv
+        if 28 <= (v.temperature or 0) <= 42:
+            lv['temp_c'] = round(float(v.temperature), 1)
+        lv['gesture'] = v.gesture
+
+        if dp.chest_resp is not None and len(dp.chest_resp) > 0:
+            self._chest_buf.extend([float(x) for x in dp.chest_resp])
+            if len(self._chest_buf) > CHEST_BUF_MAX:
+                self._chest_buf = self._chest_buf[-CHEST_BUF_MAX:]
+            # Rolling history for trigger snapshots: timestamp each sample
+            # evenly spaced at CHEST_FS (25 Hz) up to ev.t.
+            base_t = float(ev.t)
+            n = len(dp.chest_resp)
+            for i, y in enumerate(dp.chest_resp):
+                sample_t = base_t - (n - 1 - i) / CHEST_FS
+                self._chest_hist.append((sample_t, float(y)))
+
+    def _on_oxi_reading(self, ev):
+        r = ev.payload
+        val = getattr(r, 'spo2_pct', None)
+        if val is not None and val > 0:
+            self._spo2_hist.append((float(ev.t), float(val)))
+
+    def _on_snore_state(self, ev):
+        p = ev.payload or {}
+        prob = p.get('snoring_prob')
+        if prob is None:
+            # Heuristic backend: synthesize a pseudo-prob from energy
+            e = p.get('energy_db', -80)
+            prob = max(0.0, min(1.0, (e + 80) / 60))
+        self._snore_hist.append((float(ev.t), float(prob),
+                                 bool(p.get('snoring', False))))
+
+    # ──────────────────────────────────────────────────────── Public state
+
+    def snapshot(self) -> dict:
+        """One dict the web UI reads each tick / on state_request."""
+        buf = np.asarray(self._chest_buf, dtype=np.float32)
+        step = max(1, len(buf) // 200)
+        chest_plot = buf[::step].tolist() if len(buf) > 0 else []
+        chest_t = [i * step / CHEST_FS for i in range(len(chest_plot))]
+        chest_rr = self._estimate_rr(buf)
+
+        sn = self.snore.metrics()
+        sess_dur = (time.time() - self.session_start_t) if self.recorder else 0.0
+        return {
+            't': time.time(),
+            'chestband': {
+                'state': self._ble_state,
+                'err': self._ble_err,
+                'pkt': self._ble_pkt_count,
+                'vitals': dict(self._ble_latest_vitals),
+                'chest_t': chest_t,
+                'chest_y': chest_plot,
+                'chest_rr': chest_rr,
+            },
+            'oximeter': {
+                'state': self._oxi_state,
+                'err': self._oxi_err,
+                'pkt': self._oxi_pkt_count,
+                'vals': dict(self._oxi_latest_vals),
+                'flags': self._oxi_flags(),
+                'raw_tail': self._oxi_raw_frames[-20:],
+                'log_tail': self._oxi_log_lines[-40:],
+                'write_uuids': list(self._oxi_write_uuids),
+            },
+            'snore': sn,
+            'snore_backend': self.snore_backend,
+            'audio': {
+                'input_device': self.snore.device,
+                'output_device': self.audio_sink.device,
+                'single_earbud_mode': self.single_earbud_mode,
+                'single_earbud_preroll_s': self.single_earbud_preroll_s,
+                'single_earbud_postroll_s': self.single_earbud_postroll_s,
+            },
+            'posture': {
+                'cls': self._live['posture'],
+                'conf': self._live['posture_conf'],
+            },
+            'controller': self._controller_snapshot(),
+            'session': {
+                'active': self.recorder is not None,
+                'id': self.recorder.meta.session_id if self.recorder else None,
+                'subject': (self.recorder.meta.subject_id
+                            if self.recorder else None),
+                'note': (self.recorder.meta.note
+                         if self.recorder else None),
+                'mode': (self.recorder.meta.mode if self.recorder else 'A'),
+                'duration_s': sess_dur,
+                'packets': (self.recorder.packet_count
+                            if self.recorder else 0),
+                'interventions': (self.recorder.intervention_count
+                                  if self.recorder else 0),
+            },
+            'events_tail': list(self._live['events'])[-40:],
+            'last_error': self._last_error,
+        }
+
+    def _controller_snapshot(self) -> dict:
+        """Build a fat controller snapshot the UI can drive a big status
+        banner off of. Tells you exactly why (or why not) a trigger would
+        fire *right now* — so you never have to guess."""
+        cfg = dict(self._controller_cfg_values)
+        posture = self._live['posture']
+        posture_ok = posture in ('supine',)
+        # YAMNet / heuristic both expose is_snoring()
+        try:
+            snore_now = bool(self.snore.is_snoring())
+        except Exception:
+            snore_now = False
+        snore_required = bool(cfg.get('require_snoring', True))
+        in_session = self.recorder is not None
+        enabled = bool(cfg.get('enabled', True))
+
+        stat = (self.controller.status() if self.controller is not None
+                else {'state': 'idle', 'armed_duration': 0.0,
+                      'cooldown_left': 0.0, 'snoring_age_s': None,
+                      'snoring_recent_s': cfg.get('snoring_recent_s', 15.0),
+                      'within_active_window': True,
+                      'active_window_start': cfg.get('active_window_start',''),
+                      'active_window_end': cfg.get('active_window_end',''),
+                      })
+        # For the UI banner: "snoring side satisfied" is the same predicate
+        # the controller uses — snore_now OR recent-enough.
+        recent_s = float(stat.get('snoring_recent_s',
+                                  cfg.get('snoring_recent_s', 15.0)))
+        age = stat.get('snoring_age_s')
+        if snore_now:
+            snore_ok = True
+        elif age is not None and age <= recent_s:
+            snore_ok = True
+        else:
+            snore_ok = False
+        state = stat.get('state', self._live['ctrl_state'])
+        armed_dur = float(stat.get('armed_duration', 0.0))
+        cooldown_left = float(stat.get('cooldown_left', 0.0))
+        hold_s = float(cfg['trigger_hold_s'])
+
+        conds = [
+            {'key': 'session',  'label': '会话进行中',
+             'ok': in_session,
+             'hint': '点顶部「开始会话」' if not in_session else ''},
+            {'key': 'enabled',  'label': '闭环已启用',
+             'ok': enabled,
+             'hint': '在「控制器阈值」里打开' if not enabled else ''},
+            {'key': 'posture',  'label': '姿态: 仰卧',
+             'ok': posture_ok,
+             'hint': f'当前 {posture}' if not posture_ok else ''},
+            {'key': 'snoring',  'label': '检测到打鼾',
+             'ok': (snore_ok or not snore_required),
+             'hint': _snore_hint(snore_required, snore_ok, snore_now,
+                                 age, recent_s)},
+            {'key': 'cooldown', 'label': '不在冷却中',
+             'ok': cooldown_left <= 0.01,
+             'hint': (f'冷却剩余 {cooldown_left:.1f}s'
+                      if cooldown_left > 0.01 else '')},
+            {'key': 'window',   'label': '在活跃时段内',
+             'ok': bool(stat.get('within_active_window', True)),
+             'hint': (f"窗口 {stat.get('active_window_start') or '—'}"
+                      f" → {stat.get('active_window_end') or '—'}"
+                      if not stat.get('within_active_window', True)
+                      else ('未设置窗口，全天启用' if not (
+                          stat.get('active_window_start') and
+                          stat.get('active_window_end')) else ''))},
+        ]
+        all_ready = all(c['ok'] for c in conds)
+        return {
+            'state': state,
+            'last_strategy': self._live['last_strategy'],
+            'last_direction': self._live['last_direction'],
+            'config': cfg,
+            'armed_duration': armed_dur,
+            'trigger_hold_s': hold_s,
+            'armed_fraction': min(1.0, armed_dur / hold_s) if hold_s else 0,
+            'cooldown_left': cooldown_left,
+            'reason': self._live.get('ctrl_reason', ''),
+            'snoring_age_s': age,
+            'snoring_recent_s': recent_s,
+            'snoring_now': snore_now,
+            'conditions': conds,
+            'all_ready': all_ready,
+            'posture_ok': posture_ok,
+            'snore_ok': snore_ok,
+            'snore_required': snore_required,
+            'session_active': in_session,
+        }
+
+    def _oxi_flags(self) -> List[str]:
+        r = self._oxi_latest
+        if r is None:
+            return []
+        f = []
+        if getattr(r, 'finger_out', False):
+            f.append('手指未插入')
+        if getattr(r, 'probe_error', False):
+            f.append('探头异常')
+        return f
+
+    @staticmethod
+    def _estimate_rr(buf: np.ndarray, fs: float = 25.0) -> float:
+        if len(buf) < int(fs * 15):
+            return 0.0
+        x = buf - float(np.mean(buf))
+        thr = max(20.0, 0.15 * (x.max() - x.min()))
+        if thr < 40:
+            return 0.0
+        above = x > thr
+        crossings = int(np.sum(np.diff(above.astype(int)) == 1))
+        dur_s = len(x) / fs
+        if dur_s < 1:
+            return 0.0
+        rr = crossings * 60.0 / dur_s
+        return rr if 4 <= rr <= 60 else 0.0
+
+    # ──────────────────────────────────────────── Chestband BLE operations
+
+    def chest_scan(self, named_only=True, chestband_only=False,
+                   timeout=8.0) -> dict:
+        if self._ble_scan_busy:
+            return {'ok': False, 'err': 'already scanning'}
+        self._ble_scan_busy = True
+
+        async def _do():
+            try:
+                named = bool(named_only) or bool(chestband_only)
+                pairs = await ChestBandBLE.scan(
+                    timeout=timeout,
+                    named_only=named,
+                    chestband_only=bool(chestband_only))
+                self._ble_devices = pairs
+            except Exception as e:
+                self._ble_err = f'scan: {e}'
+                self._ble_devices = []
+            finally:
+                self._ble_scan_busy = False
+
+        fut = self._submit(_do())
+        if fut is not None:
+            try:
+                fut.result(timeout=timeout + 3.0)
+            except Exception:
+                pass
+        devices = [{
+            'name': dev.name or '(unknown)',
+            'address': dev.address,
+            'rssi': rssi,
+        } for dev, rssi in self._ble_devices]
+        return {'ok': True, 'devices': devices}
+
+    def chest_connect(self, address: str) -> dict:
+        if self._ble_connected or self._ble_state == 'connecting':
+            return {'ok': False, 'err': 'already connected/connecting'}
+        device = None
+        for dev, _ in self._ble_devices:
+            if dev.address == address:
+                device = dev
+                break
+        if device is None:
+            return {'ok': False, 'err': 'address not in latest scan'}
+
+        self._ble_state = 'connecting'
+        self._ble_err = ''
+
+        async def _do():
+            try:
+                self.ble = ChestBandBLE()
+                await self.ble.connect(device)
+                self._ble_pkt_count = 0
+
+                def _on_data(dp: DataPacket):
+                    try:
+                        self.bus.emit('chestband.data', dp, src='chestband')
+                    except Exception:
+                        pass
+
+                await self.ble.start_receiving(_on_data)
+                self._ble_connected = True
+                self._ble_state = 'connected'
+            except Exception as e:
+                self._ble_connected = False
+                self._ble_state = 'error'
+                self._ble_err = str(e)
+
+        self._submit(_do())
+        return {'ok': True}
+
+    def chest_disconnect(self) -> dict:
+        if not self._ble_connected:
+            return {'ok': False, 'err': 'not connected'}
+        self._ble_connected = False
+        self._ble_state = 'idle'
+
+        async def _do():
+            try:
+                if self.ble:
+                    await self.ble.disconnect()
+            except Exception:
+                pass
+
+        self._submit(_do())
+        return {'ok': True}
+
+    # ────────────────────────────────────────────── Oximeter BLE operations
+
+    def oxi_scan(self, named_only=True, oximeter_only=True,
+                 timeout=8.0) -> dict:
+        if self._oxi_scan_busy:
+            return {'ok': False, 'err': 'already scanning'}
+        self._oxi_scan_busy = True
+
+        async def _do():
+            try:
+                named = bool(named_only) or bool(oximeter_only)
+                pairs = await OximeterBLE.scan(
+                    timeout=timeout,
+                    named_only=named,
+                    oximeter_only=bool(oximeter_only))
+                self._oxi_devices = pairs
+            except Exception as e:
+                self._oxi_err = f'scan: {e}'
+                self._oxi_devices = []
+            finally:
+                self._oxi_scan_busy = False
+
+        fut = self._submit(_do())
+        if fut is not None:
+            try:
+                fut.result(timeout=timeout + 3.0)
+            except Exception:
+                pass
+        return {'ok': True, 'devices': [{
+            'name': dev.name or '(unknown)',
+            'address': dev.address,
+            'rssi': rssi,
+        } for dev, rssi in self._oxi_devices]}
+
+    def oxi_connect(self, address: str) -> dict:
+        if self._oxi_connected or self._oxi_state == 'connecting':
+            return {'ok': False, 'err': 'already connected/connecting'}
+        device = None
+        for dev, _ in self._oxi_devices:
+            if dev.address == address:
+                device = dev
+                break
+        if device is None:
+            return {'ok': False, 'err': 'address not in latest scan'}
+
+        self._oxi_state = 'connecting'
+        self._oxi_err = ''
+
+        async def _do():
+            try:
+                self.oxi = OximeterBLE()
+                self._oxi_pkt_count = 0
+                self._oxi_raw_frames = []
+                self._oxi_log_lines = []
+
+                def _on_reading(r: OxiReading):
+                    self._oxi_latest = r
+                    if r.spo2_pct is not None and r.spo2_pct > 0:
+                        self._oxi_latest_vals['spo2'] = r.spo2_pct
+                    if r.pulse_rate is not None and r.pulse_rate > 0:
+                        self._oxi_latest_vals['pulse'] = r.pulse_rate
+                    if r.pi is not None and r.pi > 0:
+                        self._oxi_latest_vals['pi'] = round(float(r.pi), 1)
+                    try:
+                        self.bus.emit('oximeter.reading', r, src='oximeter')
+                    except Exception:
+                        pass
+
+                def _on_raw(b: bytes):
+                    self._oxi_pkt_count += 1
+                    self._oxi_raw_frames.append(b.hex(' '))
+                    if len(self._oxi_raw_frames) > 80:
+                        self._oxi_raw_frames = self._oxi_raw_frames[-80:]
+
+                def _on_log(msg: str):
+                    for line in msg.splitlines():
+                        self._oxi_log_lines.append(line)
+                    if len(self._oxi_log_lines) > 80:
+                        self._oxi_log_lines = self._oxi_log_lines[-80:]
+
+                self.oxi.on_reading = _on_reading
+                self.oxi.on_raw_frame = _on_raw
+                self.oxi.on_log = _on_log
+                await self.oxi.connect(device)
+                await self.oxi.start_receiving()
+                self._oxi_write_uuids = self.oxi.list_write_uuids()
+                self._oxi_connected = True
+                self._oxi_state = 'connected'
+            except Exception as e:
+                self._oxi_connected = False
+                self._oxi_state = 'error'
+                self._oxi_err = str(e)
+
+        self._submit(_do())
+        return {'ok': True}
+
+    def oxi_disconnect(self) -> dict:
+        self._oxi_connected = False
+        self._oxi_state = 'idle'
+
+        async def _do():
+            try:
+                if self.oxi:
+                    await self.oxi.disconnect()
+            except Exception:
+                pass
+
+        self._submit(_do())
+        return {'ok': True}
+
+    def oxi_manual_send(self, hex_str: str, target_uuid: Optional[str] = None):
+        if not self._oxi_connected or self.oxi is None:
+            return {'ok': False, 'err': 'not connected'}
+        try:
+            bytes.fromhex(hex_str.replace(' ', '').replace(',', ''))
+        except Exception as e:
+            return {'ok': False, 'err': f'hex parse: {e}'}
+
+        async def _run():
+            await self.oxi.write_raw(
+                hex_str, target_uuid=target_uuid, with_response=False)
+
+        self._submit(_run())
+        return {'ok': True}
+
+    def oxi_retry_wake(self):
+        if not self._oxi_connected or self.oxi is None:
+            return {'ok': False, 'err': 'not connected'}
+
+        async def _run():
+            await self.oxi._send_start_command()
+
+        self._submit(_run())
+        return {'ok': True}
+
+    # ────────────────────────────────────────────── Controller / sessions
+
+    def set_controller_config(self, patch: dict) -> dict:
+        v = self._controller_cfg_values
+        for k in ('trigger_hold_s', 'debounce_s', 'response_window_s',
+                  'cooldown_s', 'cooldown_no_response_s',
+                  'level_db', 'snoring_recent_s'):
+            if k in patch:
+                v[k] = float(patch[k])
+        for k in ('enabled', 'require_snoring'):
+            if k in patch:
+                v[k] = bool(patch[k])
+        for k in ('active_window_start', 'active_window_end'):
+            if k in patch:
+                v[k] = str(patch[k] or '').strip()
+        if self.controller is not None:
+            self.controller.cfg = self._build_cfg()
+        if self.posture is not None:
+            self.posture.debounce_s = v['debounce_s']
+        return {'ok': True, 'config': dict(v)}
+
+    def _build_cfg(self) -> ControllerConfig:
+        v = self._controller_cfg_values
+        return ControllerConfig(
+            trigger_postures=('supine',),
+            require_snoring=v['require_snoring'],
+            trigger_hold_s=v['trigger_hold_s'],
+            snoring_recent_s=v['snoring_recent_s'],
+            strategy_pool=('P1', 'P2', 'P3'),
+            direction_policy='opposite',
+            level_db=v['level_db'],
+            response_window_s=v['response_window_s'],
+            cooldown_s=v['cooldown_s'],
+            cooldown_no_response_s=v['cooldown_no_response_s'],
+            active_window_start=v.get('active_window_start', ''),
+            active_window_end=v.get('active_window_end', ''),
+            enabled=v['enabled'],
+        )
+
+    # ── Audio device selection ──
+
+    def list_audio_devices(self) -> dict:
+        """Enumerate sounddevice devices (fresh view of CoreAudio).
+
+        PortAudio caches the device list at process start, so BT devices
+        that pair later (AirPods) are invisible to the main process even
+        after `Pa_Terminate/Pa_Initialize`. Work around it by shelling out
+        to a short-lived Python subprocess — every call gets a pristine
+        CoreAudio snapshot without disturbing our live InputStream.
+        """
+        raw, default_in, default_out, err = self._query_devices_subprocess()
+        if err:
+            return {'ok': False, 'err': err,
+                    'inputs': [], 'outputs': [],
+                    'selected_input': self.snore.device,
+                    'selected_output': self.audio_sink.device}
+        inputs, outputs = [], []
+        for idx, d in enumerate(raw):
+            entry = {
+                'index': idx,
+                'name': d.get('name', f'device {idx}'),
+                'hostapi': d.get('hostapi'),
+                'max_input_channels': d.get('max_input_channels', 0),
+                'max_output_channels': d.get('max_output_channels', 0),
+                'default_samplerate': d.get('default_samplerate'),
+            }
+            if entry['max_input_channels'] > 0:
+                inputs.append({**entry, 'is_default': idx == default_in})
+            if entry['max_output_channels'] > 0:
+                outputs.append({**entry, 'is_default': idx == default_out})
+        return {
+            'ok': True,
+            'inputs': inputs,
+            'outputs': outputs,
+            'selected_input': self.snore.device,
+            'selected_output': self.audio_sink.device,
+        }
+
+    @staticmethod
+    def _query_devices_subprocess(timeout: float = 4.0):
+        import sys as _sys
+        code = (
+            "import json, sys\n"
+            "try:\n"
+            "    import sounddevice as sd\n"
+            "    devs = [dict(d) for d in sd.query_devices()]\n"
+            "    try:\n"
+            "        d_in, d_out = sd.default.device\n"
+            "    except Exception:\n"
+            "        d_in, d_out = None, None\n"
+            "    json.dump({'devs': devs,\n"
+            "               'default_in': d_in,\n"
+            "               'default_out': d_out}, sys.stdout)\n"
+            "except Exception as e:\n"
+            "    json.dump({'err': str(e)}, sys.stdout)\n"
+        )
+        try:
+            out = subprocess.run(
+                [_sys.executable, '-c', code],
+                capture_output=True, text=True, timeout=timeout)
+            if out.returncode != 0:
+                return [], None, None, (out.stderr or '').strip() or 'subprocess failed'
+            data = json.loads(out.stdout)
+            if 'err' in data:
+                return [], None, None, data['err']
+            return (data.get('devs', []),
+                    data.get('default_in'),
+                    data.get('default_out'),
+                    None)
+        except subprocess.TimeoutExpired:
+            return [], None, None, 'subprocess timeout'
+        except Exception as e:
+            return [], None, None, str(e)
+
+    def set_single_earbud_mode(self, on: bool,
+                               preroll_s: Optional[float] = None,
+                               postroll_s: Optional[float] = None) -> dict:
+        self.single_earbud_mode = bool(on)
+        if preroll_s is not None:
+            self.single_earbud_preroll_s = max(0.3, float(preroll_s))
+        if postroll_s is not None:
+            self.single_earbud_postroll_s = max(0.0, float(postroll_s))
+        return {
+            'ok': True,
+            'enabled': self.single_earbud_mode,
+            'preroll_s': self.single_earbud_preroll_s,
+            'postroll_s': self.single_earbud_postroll_s,
+        }
+
+    def set_audio_devices(self, input_device=None, output_device=None,
+                          set_input: bool = False,
+                          set_output: bool = False) -> dict:
+        """Set input (mic) and/or output (playback) devices.
+        Use the explicit `set_input/set_output` flags so None can mean
+        "switch back to OS default" instead of "leave unchanged".
+        """
+        if set_input:
+            try:
+                self.snore.set_device(input_device)
+            except Exception as e:
+                return {'ok': False, 'err': f'input: {e}'}
+        if set_output:
+            try:
+                self.audio_sink.set_device(output_device)
+            except Exception as e:
+                return {'ok': False, 'err': f'output: {e}'}
+        return {
+            'ok': True,
+            'selected_input': self.snore.device,
+            'selected_output': self.audio_sink.device,
+            'snore_status': self.snore.status,
+            'snore_err': self.snore.error,
+        }
+
+    def set_snore_config(self, patch: dict) -> dict:
+        kwargs = {}
+        if 'energy_db' in patch:
+            kwargs['energy_db'] = patch['energy_db']
+        if 'band_ratio_min' in patch:
+            kwargs['band_ratio_min'] = patch['band_ratio_min']
+        if 'snore_prob_thresh' in patch:
+            kwargs['snore_prob_thresh'] = patch['snore_prob_thresh']
+        try:
+            self.snore.set_thresholds(**kwargs)
+        except TypeError:
+            # Heuristic set_thresholds rejects snore_prob_thresh kwarg.
+            kwargs.pop('snore_prob_thresh', None)
+            self.snore.set_thresholds(**kwargs)
+        cfg = {
+            'energy_db': getattr(self.snore, 'energy_db', None),
+            'band_ratio_min': getattr(self.snore, 'band_ratio_min', None),
+            'snore_prob_thresh': getattr(self.snore,
+                                         'snore_prob_thresh', None),
+        }
+        return {'ok': True, 'config': cfg, 'backend': self.snore_backend}
+
+    def set_snore_backend(self, backend: str) -> dict:
+        """Swap detector while keeping the input device and listening state.
+        Accepts 'yamnet' or 'heuristic'. Returns the active backend (may be
+        unchanged on failure).
+        """
+        backend = (backend or '').lower()
+        if backend == self.snore_backend:
+            return {'ok': True, 'backend': self.snore_backend,
+                    'note': 'already active'}
+        if backend not in ('yamnet', 'heuristic'):
+            return {'ok': False, 'err': f'unknown backend: {backend}'}
+
+        prev_device = getattr(self.snore, 'device', None)
+        try:
+            self.snore.stop()
+        except Exception:
+            pass
+
+        if backend == 'yamnet':
+            if YamnetSnoreDetector is None:
+                return {'ok': False, 'err': 'tensorflow/tf-hub 未安装',
+                        'backend': self.snore_backend}
+            try:
+                new_snore = YamnetSnoreDetector(self.bus, device=prev_device)
+            except Exception as e:
+                return {'ok': False, 'err': f'init yamnet: {e}',
+                        'backend': self.snore_backend}
+        else:
+            new_snore = MicSnoreDetector(self.bus, device=prev_device)
+
+        self.snore = new_snore
+        self.snore_backend = backend
+        # Rewire the closed-loop controller's snoring provider if a session
+        # is currently active — otherwise it's still pointing at the old
+        # detector's `is_snoring` method.
+        if self.controller is not None:
+            self.controller.snoring_provider = self.snore.is_snoring
+        self.snore.start()
+        return {'ok': True, 'backend': self.snore_backend,
+                'status': self.snore.status, 'err': self.snore.error}
+
+    def session_start(self, tag='', subject='', note='', mode='A') -> dict:
+        if self.recorder is not None:
+            return {'ok': False, 'err': 'session already running'}
+        mode = (mode or 'A').upper()
+        if mode not in ('A', 'B'):
+            return {'ok': False, 'err': f'unknown mode: {mode}'}
+        if mode == 'B':
+            return {'ok': False,
+                    'err': 'Block B 尚未实现 (controller 仅支持 A)'}
+        sid = new_session_id(tag.strip())
+        meta = SessionMeta(
+            session_id=sid,
+            started_at=datetime.now().isoformat(timespec='seconds'),
+            subject_id=subject.strip(),
+            note=note.strip(),
+            protocol=f'block_{mode.lower()}_pilot',
+            mode=mode,
+            config=asdict(self._build_cfg()),
+        )
+        self.recorder = SessionRecorder(self.bus, meta)
+        self.session_start_t = time.time()
+        self.posture.debounce_s = self._controller_cfg_values['debounce_s']
+        self.controller = ClosedLoopController(
+            self.bus, self.audio_sink, self._build_cfg(),
+            snoring_provider=self.snore.is_snoring)
+        self.bus.emit('session.marker', {'kind': 'start', 'session': sid},
+                      src='web')
+        self._live['events'] = []
+        self._push_event(f">> 会话开始 · Block {mode} · 受试 "
+                         f"{subject.strip() or '-'}  · id {sid}")
+        return {'ok': True, 'session_id': sid}
+
+    def session_stop(self) -> dict:
+        if self.recorder is None:
+            return {'ok': False, 'err': 'no session'}
+        self.bus.emit('session.marker', {'kind': 'stop'}, src='web')
+        try:
+            if self.controller:
+                self.controller.close()
+            self.recorder.close()
+        finally:
+            sid = self.recorder.meta.session_id
+            self.controller = None
+            self.recorder = None
+        return {'ok': True, 'session_id': sid}
+
+    def manual_trigger(self) -> dict:
+        if self.controller is not None:
+            self.controller.manual_trigger()
+            return {'ok': True, 'mode': 'session'}
+        # No session: fire a one-shot unlogged test playback.
+        strategy = random.choice(['P1', 'P2', 'P3'])
+        direction = random.choice(['left', 'right'])
+        params = get_default_params(strategy)
+        params['level_db'] = self._controller_cfg_values['level_db']
+        wave = synthesize(strategy, params, direction, DEFAULT_SR,
+                          seed=random.randint(0, 2 ** 31 - 1))
+        self.audio_sink.play(PlaybackRequest(wave, DEFAULT_SR, {
+            'strategy': strategy, 'direction': direction, 'manual': True,
+        }))
+        return {'ok': True, 'mode': 'preview',
+                'strategy': strategy, 'direction': direction}
+
+    def stop_audio(self):
+        self.audio_sink.stop()
+        return {'ok': True}
+
+    def test_sound(self, strategy='P1', direction='left',
+                   level_db: Optional[float] = None) -> dict:
+        if strategy not in STRATEGY_REGISTRY:
+            return {'ok': False, 'err': 'unknown strategy'}
+        params = get_default_params(strategy)
+        if level_db is not None:
+            params['level_db'] = float(level_db)
+        wave = synthesize(strategy, params, direction, DEFAULT_SR,
+                          seed=random.randint(0, 2 ** 31 - 1))
+        self.audio_sink.play(PlaybackRequest(wave, DEFAULT_SR, {
+            'strategy': strategy, 'direction': direction, 'test': True,
+        }))
+        return {'ok': True, 'strategy': strategy, 'direction': direction}
+
+    def _save_trigger_audio(self, trigger_at: float, strategy: str,
+                            direction: str,
+                            chest_before_s: float = 30.0,
+                            chest_after_s: float = 30.0,
+                            mic_before_s: float = 10.0,
+                            mic_after_s: float = 10.0,
+                            spo2_before_s: float = 30.0,
+                            spo2_after_s: float = 60.0):
+        """After each trigger, dump a ±N s multi-channel snapshot:
+            sessions/<id>/events/<YYYYMMDD_HHMMSS>_<A|B>_<strategy>_<dir>.npz
+            sessions/<id>/events/<same>_mic.wav        (mic around trigger)
+            sessions/<id>/events/<same>_played.wav     (the intervention we played)
+        Everything is timestamped relative to `trigger_at` (unix seconds).
+        Runs on a short background thread so we don't block the event loop.
+        """
+        if self.recorder is None:
+            return
+        sess_dir = SESSIONS_DIR / self.recorder.meta.session_id
+        ev_dir = sess_dir / 'events'
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        block = self.recorder.meta.mode
+
+        # Copy the last synthesized / played wave so the worker can write
+        # it out even if the controller starts the next one shortly after.
+        played_wave = getattr(self.audio_sink, 'last_wave', None)
+        played_sr = int(getattr(self.audio_sink, 'last_sample_rate', 0) or 0)
+
+        def _slice_hist(hist, t0, t1, with_flag=False):
+            """Return two parallel np.ndarrays for t and v within [t0,t1]."""
+            ts_out, v_out, f_out = [], [], []
+            for row in list(hist):
+                if with_flag:
+                    t, v, f = row
+                    if t0 <= t <= t1:
+                        ts_out.append(t); v_out.append(v); f_out.append(f)
+                else:
+                    t, v = row
+                    if t0 <= t <= t1:
+                        ts_out.append(t); v_out.append(v)
+            if with_flag:
+                return (np.asarray(ts_out), np.asarray(v_out),
+                        np.asarray(f_out, dtype=bool))
+            return np.asarray(ts_out), np.asarray(v_out)
+
+        def _do():
+            # Wait the longest "after" window so buffers are filled.
+            tail = max(chest_after_s, mic_after_s, spo2_after_s) + 0.2
+            time.sleep(tail)
+            try:
+                ts_str = datetime.fromtimestamp(trigger_at).strftime(
+                    '%Y%m%d_%H%M%S')
+                base = f"{ts_str}_{block}_{strategy}_{direction or 'center'}"
+
+                # Mic audio ± around trigger. snore.snapshot returns the
+                # most recent N seconds, so we pull *after* the tail sleep.
+                span = mic_before_s + mic_after_s
+                try:
+                    wav = self.snore.snapshot(span + 0.2)
+                except Exception:
+                    wav = np.zeros(0, dtype=np.float32)
+                if wav.size > 0:
+                    sf.write(str(ev_dir / f"{base}_mic.wav"),
+                             wav, self.snore.sr)
+
+                # Played intervention wav.
+                if played_wave is not None and played_sr > 0:
+                    sf.write(str(ev_dir / f"{base}_played.wav"),
+                             played_wave, int(played_sr))
+
+                # Chest resp ±30s + SpO2 ±60s + snoring_prob ±30s → npz.
+                chest_t, chest_y = _slice_hist(
+                    self._chest_hist,
+                    trigger_at - chest_before_s, trigger_at + chest_after_s)
+                spo2_t, spo2_y = _slice_hist(
+                    self._spo2_hist,
+                    trigger_at - spo2_before_s, trigger_at + spo2_after_s)
+                snore_t, snore_p, snore_flag = _slice_hist(
+                    self._snore_hist,
+                    trigger_at - chest_before_s, trigger_at + chest_after_s,
+                    with_flag=True)
+
+                np.savez_compressed(
+                    str(ev_dir / f"{base}.npz"),
+                    trigger_at=np.float64(trigger_at),
+                    block=block,
+                    strategy=strategy,
+                    direction=direction or 'center',
+                    chest_t=chest_t.astype(np.float64),
+                    chest_y=chest_y.astype(np.float32),
+                    chest_fs=np.float32(CHEST_FS),
+                    spo2_t=spo2_t.astype(np.float64),
+                    spo2_y=spo2_y.astype(np.float32),
+                    snore_t=snore_t.astype(np.float64),
+                    snore_p=snore_p.astype(np.float32),
+                    snore_flag=snore_flag,
+                )
+            except Exception as e:
+                try:
+                    self.bus.emit('session.error',
+                                  {'where': 'save_trigger_snapshot',
+                                   'error': str(e)}, src='runtime')
+                except Exception:
+                    pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ──────────────────────────────────────────────── Sounds / strategies
+
+    def list_strategies(self) -> list:
+        out = []
+        for k in STRATEGY_ORDER:
+            s = STRATEGY_REGISTRY[k]
+            out.append({
+                'key': k,
+                'name': getattr(s, 'name', k),
+                'description': getattr(s, 'description', ''),
+                'has_direction': bool(getattr(s, 'has_direction', True)),
+                'params': [{
+                    'key': p.key,
+                    'label': p.label,
+                    'unit': getattr(p, 'unit', ''),
+                    'group': getattr(p, 'group', 'general'),
+                    'min': float(p.min_val),
+                    'max': float(p.max_val),
+                    'step': float(p.step),
+                    'default': float(p.default),
+                } for p in s.params],
+            })
+        return out
+
+    def synth_wave(self, strategy: str, params: dict,
+                   direction: str, seed: Optional[int] = None) -> np.ndarray:
+        sdef = STRATEGY_REGISTRY[strategy]
+        d = direction if sdef.has_direction else 'center'
+        p = dict(get_default_params(strategy))
+        p.update(params or {})
+        s = seed if seed is not None else random.randint(0, 2 ** 31 - 1)
+        return synthesize(strategy, p, d, DEFAULT_SR, seed=s)
+
+    def preview_wave(self, strategy: str, params: dict,
+                     direction: str) -> dict:
+        try:
+            w = self.synth_wave(strategy, params, direction)
+        except Exception as e:
+            return {'ok': False, 'err': str(e)}
+        # Downsample to ~2000 pts for plotting
+        n = len(w)
+        step = max(1, n // 2000)
+        t_ms = (np.arange(0, n, step) / DEFAULT_SR * 1000.0).tolist()
+        L = w[::step, 0].tolist()
+        R = w[::step, 1].tolist()
+        return {
+            'ok': True, 'sr': DEFAULT_SR, 'duration_ms': n / DEFAULT_SR * 1000.0,
+            't_ms': t_ms, 'L': L, 'R': R,
+        }
+
+    def play_strategy(self, strategy: str, params: dict,
+                      direction: str, repeats=1, gap_s=0.5) -> dict:
+        try:
+            w = self.synth_wave(strategy, params, direction)
+        except Exception as e:
+            return {'ok': False, 'err': str(e)}
+        if repeats > 1:
+            gap = np.zeros((int(gap_s * DEFAULT_SR), 2), dtype=w.dtype)
+            parts = []
+            for i in range(repeats):
+                parts.append(w)
+                if i < repeats - 1:
+                    parts.append(gap)
+            w = np.concatenate(parts)
+        try:
+            self.audio_sink.play(PlaybackRequest(w, DEFAULT_SR, {
+                'strategy': strategy, 'direction': direction, 'preview': True,
+            }))
+        except Exception as e:
+            return {'ok': False, 'err': f'audio: {e}'}
+        return {'ok': True, 'duration_ms': len(w) / DEFAULT_SR * 1000.0}
+
+    def export_wav(self, strategy: str, params: dict,
+                   direction: str) -> dict:
+        try:
+            w = self.synth_wave(strategy, params, direction)
+        except Exception as e:
+            return {'ok': False, 'err': str(e)}
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = f"{strategy}_{direction}_{ts}.wav"
+        fp = OUTPUT_DIR / name
+        sf.write(str(fp), w, DEFAULT_SR)
+        return {'ok': True, 'path': str(fp), 'name': name}
+
+    def batch_export(self) -> dict:
+        levels = [-30, -20, -10, -6]
+        n = 0
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        for sk in STRATEGY_ORDER:
+            sdef = STRATEGY_REGISTRY[sk]
+            pr = dict(get_default_params(sk))
+            dirs = ['left', 'right'] if sdef.has_direction else ['center']
+            for d in dirs:
+                for lv in levels:
+                    pr['level_db'] = lv
+                    w = synthesize(sk, pr, d, DEFAULT_SR,
+                                   seed=random.randint(0, 2 ** 31 - 1))
+                    sf.write(str(OUTPUT_DIR / f"{sk}_{d}_{lv}dB_{ts}.wav"),
+                             w, DEFAULT_SR)
+                    n += 1
+        return {'ok': True, 'count': n}
+
+    # ── Presets ──
+
+    def list_presets(self) -> list:
+        out = []
+        for f in sorted(PRESETS_DIR.glob('*.json')):
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    out.append(json.load(fh))
+            except Exception:
+                continue
+        return out
+
+    def save_preset(self, name: str, strategy: str, direction: str,
+                    params: dict, note: str = '', seed: int = 42) -> dict:
+        name = (name or '').strip()
+        if not name:
+            return {'ok': False, 'err': 'empty name'}
+        obj = {
+            'name': name,
+            'strategy': strategy,
+            'direction': direction,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'note': note or '',
+            'params': dict(params or {}),
+            'seed': int(seed),
+        }
+        safe = ''.join(c if c.isalnum() or c in '-_' else '_' for c in name)
+        with open(PRESETS_DIR / f'{safe}.json', 'w', encoding='utf-8') as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+        return {'ok': True}
+
+    def delete_preset(self, name: str) -> dict:
+        safe = ''.join(c if c.isalnum() or c in '-_' else '_' for c in name)
+        fp = PRESETS_DIR / f'{safe}.json'
+        if fp.exists():
+            fp.unlink()
+            return {'ok': True}
+        return {'ok': False, 'err': 'not found'}
+
+    # ── Session history ──
+
+    def list_sessions(self, limit: int = 10) -> list:
+        if not SESSIONS_DIR.exists():
+            return []
+        dirs = sorted([p for p in SESSIONS_DIR.iterdir() if p.is_dir()],
+                      key=lambda p: p.name, reverse=True)
+        out = []
+        for d in dirs[:limit]:
+            meta = {}
+            summ = {}
+            try:
+                mf = d / 'meta.json'
+                if mf.exists():
+                    meta = json.loads(mf.read_text(encoding='utf-8'))
+                sf2 = d / 'summary.json'
+                if sf2.exists():
+                    summ = json.loads(sf2.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+            dur_s = None
+            try:
+                t0 = datetime.fromisoformat(summ.get('started_at') or
+                                            meta.get('started_at'))
+                t1 = datetime.fromisoformat(summ.get('ended_at'))
+                dur_s = int((t1 - t0).total_seconds())
+            except Exception:
+                pass
+            out.append({
+                'id': d.name,
+                'started_at': meta.get('started_at'),
+                'subject': meta.get('subject_id'),
+                'note': meta.get('note'),
+                'duration_s': dur_s,
+                'interventions': summ.get('interventions'),
+                'packets': summ.get('chestband_packets'),
+                'ongoing': not summ,
+            })
+        return out
+
+    def open_sessions_dir(self):
+        try:
+            subprocess.Popen(['open', str(SESSIONS_DIR)])
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'err': str(e)}
+
+    # ── Replay: session detail + per-event bundle ──
+
+    def session_detail(self, session_id: str) -> dict:
+        """Everything a replay UI needs for one session:
+        meta.json, all interventions (paired with responses), and a list of
+        available event snapshot files under events/.
+        """
+        sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
+        d = SESSIONS_DIR / sid
+        if not d.is_dir():
+            return {'ok': False, 'err': 'session not found'}
+        meta = {}
+        try:
+            if (d / 'meta.json').exists():
+                meta = json.loads((d / 'meta.json').read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        summary = {}
+        try:
+            if (d / 'summary.json').exists():
+                summary = json.loads(
+                    (d / 'summary.json').read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        report_summary = {}
+        if (d / 'report' / 'summary.json').exists():
+            try:
+                report_summary = json.loads(
+                    (d / 'report' / 'summary.json').read_text(encoding='utf-8'))
+            except Exception:
+                pass
+
+        interventions = []
+        try:
+            if (d / 'interventions.jsonl').exists():
+                for line in (d / 'interventions.jsonl').read_text(
+                        encoding='utf-8').splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        interventions.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Pair responses
+        responses = []
+        try:
+            if (d / 'events.jsonl').exists():
+                for line in (d / 'events.jsonl').read_text(
+                        encoding='utf-8').splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                        if e.get('kind') == 'intervention.response':
+                            responses.append(e)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        r_it = iter(responses)
+        events = []
+        for iv in interventions:
+            resp_evt = next(r_it, None)
+            resp = (resp_evt or {}).get('payload') or {}
+            t = float(iv.get('t', 0.0))
+            ts_str = datetime.fromtimestamp(t).strftime('%Y%m%d_%H%M%S')
+            block = iv.get('block', meta.get('mode', 'A'))
+            strategy = iv.get('strategy', '')
+            direction = iv.get('direction') or 'center'
+            base = f"{ts_str}_{block}_{strategy}_{direction}"
+            event_dir = d / 'events'
+            files = {}
+            for suffix, key in (('.npz', 'npz'),
+                                ('_mic.wav', 'mic'),
+                                ('_played.wav', 'played')):
+                fp = event_dir / (base + suffix)
+                if fp.exists():
+                    files[key] = f"/api/history/{sid}/event/{base}{suffix}"
+            events.append({
+                't': t,
+                'time_str': datetime.fromtimestamp(t).strftime('%H:%M:%S'),
+                'block': block,
+                'strategy': strategy,
+                'direction': direction,
+                'level_db': iv.get('level_db'),
+                'reason': iv.get('reason'),
+                'success': bool(resp.get('success', False)),
+                'latency_s': resp.get('latency_s'),
+                'response_reason': resp.get('reason'),
+                'base': base,
+                'files': files,
+            })
+
+        return {
+            'ok': True,
+            'id': sid,
+            'meta': meta,
+            'summary': summary,
+            'report_summary': report_summary,
+            'events': events,
+            'has_report': (d / 'report' / 'strategy_report.md').exists(),
+        }
+
+    @staticmethod
+    def session_event_file(session_id: str, fname: str) -> Optional[Path]:
+        """Validate and return the absolute path of an event asset."""
+        sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
+        # Defensive: prevent .. path escape.
+        safe_name = Path(fname).name
+        p = SESSIONS_DIR / sid / 'events' / safe_name
+        return p if p.is_file() else None
+
+    def run_session_analysis(self, session_id: str) -> dict:
+        """Invoke scripts/analyze_night.py on one session and return the
+        resulting summary payload (so the UI can trigger it on demand)."""
+        sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
+        d = SESSIONS_DIR / sid
+        if not d.is_dir():
+            return {'ok': False, 'err': 'session not found'}
+        script = ROOT / 'scripts' / 'analyze_night.py'
+        try:
+            subprocess.run(
+                [sys.executable, str(script), str(d)],
+                check=True, capture_output=True, text=True, timeout=60)
+        except subprocess.CalledProcessError as e:
+            return {'ok': False, 'err': e.stderr or e.stdout or str(e)}
+        except Exception as e:
+            return {'ok': False, 'err': str(e)}
+        return self.session_detail(session_id)
+
+    # ── cleanup ──
+
+    def shutdown(self):
+        try:
+            self.session_stop()
+        except Exception:
+            pass
+        try:
+            self.snore.stop()
+        except Exception:
+            pass
+        try:
+            if self._ble_connected and self.ble:
+                fut = self._submit(self.ble.disconnect())
+                if fut:
+                    fut.result(timeout=2.0)
+            if self._oxi_connected and self.oxi:
+                fut = self._submit(self.oxi.disconnect())
+                if fut:
+                    fut.result(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            if self._ble_loop and self._ble_loop.is_running():
+                self._ble_loop.call_soon_threadsafe(self._ble_loop.stop)
+        except Exception:
+            pass
+
+
+# Process-wide singleton (lazily initialized by the web app)
+_runtime_lock = threading.Lock()
+_runtime: Optional[OsaRuntime] = None
+
+
+def get_runtime() -> OsaRuntime:
+    global _runtime
+    with _runtime_lock:
+        if _runtime is None:
+            _runtime = OsaRuntime()
+        return _runtime

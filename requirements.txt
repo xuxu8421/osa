@@ -1,5 +1,18 @@
-numpy
+# Pin numpy < 2 because tensorflow-macos 2.16 was built against the 1.x
+# C-ABI (umath) and will fail to import under numpy 2.x. If you also need
+# opencv-python / opencv-python-headless, use opencv-python<=4.10 (those
+# still accept numpy 1.x). See:
+# https://github.com/tensorflow/tensorflow/issues/66790
+numpy>=1.26,<2
 scipy
 sounddevice
 soundfile
 dearpygui
+bleak
+fastapi
+uvicorn[standard]
+# Optional: YAMNet-based snore detector. Comment out on machines where
+# tensorflow-macos wheels are unavailable — code falls back to the
+# heuristic detector automatically.
+tensorflow-macos>=2.15,<2.17 ; platform_system == "Darwin"
+tensorflow-hub
