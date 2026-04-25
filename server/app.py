@@ -20,18 +20,18 @@ Endpoints:
   POST /api/ble/chest/scan        — scan chest bands
   POST /api/ble/chest/connect     — connect
   POST /api/ble/chest/disconnect  — disconnect
-  POST /api/ble/oxi/scan          — scan oximeters
-  POST /api/ble/oxi/connect
-  POST /api/ble/oxi/disconnect
-  POST /api/ble/oxi/manual        — raw HEX write
-  POST /api/ble/oxi/retry         — re-send start command
+  GET/POST /api/audio/devices     — list / set audio input/output devices
   POST /api/controller/config     — update thresholds
-  POST /api/snore/config          — update snore thresholds
+  POST /api/snore/config          — update YAMNet threshold
   POST /api/session/start         — start recording session
   POST /api/session/stop
   POST /api/trigger               — manual trigger
   GET  /api/history               — session list
   POST /api/history/open          — open sessions/ in Finder
+  GET  /api/history/{id}          — session detail (events)
+  POST /api/history/{id}/analyze  — run analyze_night.py on this session
+  GET  /api/history/{id}/event_detail?base=...   — single event traces
+  GET  /api/history/{id}/event/{fname}            — raw event asset
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -52,7 +52,7 @@ from .runtime import get_runtime
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / 'web'
 
-app = FastAPI(title='OSA Experiment Console', version='0.1.0')
+app = FastAPI(title='OSA Experiment Console', version='0.2.0')
 
 
 # ── Static web UI ─────────────────────────────────────────────────────────
@@ -71,7 +71,6 @@ class SessionStartReq(BaseModel):
     tag: str = ''
     subject: str = ''
     note: str = ''
-    mode: str = 'A'            # 'A' = Block A posture, 'B' = Block B (wip)
 
 
 class ConnectReq(BaseModel):
@@ -81,12 +80,6 @@ class ConnectReq(BaseModel):
 class ChestScanReq(BaseModel):
     named_only: bool = True
     chestband_only: bool = False
-    timeout: float = 8.0
-
-
-class OxiScanReq(BaseModel):
-    named_only: bool = True
-    oximeter_only: bool = True
     timeout: float = 8.0
 
 
@@ -124,6 +117,7 @@ class PresetDelReq(BaseModel):
 
 class CtrlCfgReq(BaseModel):
     trigger_hold_s: Optional[float] = None
+    retry_trigger_hold_s: Optional[float] = None
     debounce_s: Optional[float] = None
     response_window_s: Optional[float] = None
     cooldown_s: Optional[float] = None
@@ -132,45 +126,27 @@ class CtrlCfgReq(BaseModel):
     enabled: Optional[bool] = None
     require_snoring: Optional[bool] = None
     snoring_recent_s: Optional[float] = None
+    confirm_snore_bouts: Optional[int] = None
     active_window_start: Optional[str] = None
     active_window_end: Optional[str] = None
 
 
 class SnoreCfgReq(BaseModel):
-    energy_db: Optional[float] = None
-    band_ratio_min: Optional[float] = None
     snore_prob_thresh: Optional[float] = None
 
 
-class SnoreBackendReq(BaseModel):
-    backend: str
-
-
 class AudioDevReq(BaseModel):
-    # Explicit flags because `None` is a meaningful value (= OS default).
     set_input: bool = False
     input_device: Optional[int] = None
     set_output: bool = False
     output_device: Optional[int] = None
 
 
-class SingleEarbudReq(BaseModel):
-    enabled: bool
-    preroll_s: Optional[float] = None
-    postroll_s: Optional[float] = None
-
-
-class OxiManualReq(BaseModel):
-    hex_str: str
-    target_uuid: Optional[str] = None
-
-
 # ── State / events ────────────────────────────────────────────────────────
 
 @app.get('/api/state')
 def api_state():
-    rt = get_runtime()
-    return rt.snapshot()
+    return get_runtime().snapshot()
 
 
 @app.websocket('/ws')
@@ -261,36 +237,6 @@ def api_chest_disconnect():
     return get_runtime().chest_disconnect()
 
 
-# ── BLE oximeter ──────────────────────────────────────────────────────────
-
-@app.post('/api/ble/oxi/scan')
-def api_oxi_scan(req: OxiScanReq):
-    return get_runtime().oxi_scan(
-        named_only=req.named_only,
-        oximeter_only=req.oximeter_only,
-        timeout=req.timeout)
-
-
-@app.post('/api/ble/oxi/connect')
-def api_oxi_connect(req: ConnectReq):
-    return get_runtime().oxi_connect(req.address)
-
-
-@app.post('/api/ble/oxi/disconnect')
-def api_oxi_disconnect():
-    return get_runtime().oxi_disconnect()
-
-
-@app.post('/api/ble/oxi/manual')
-def api_oxi_manual(req: OxiManualReq):
-    return get_runtime().oxi_manual_send(req.hex_str, req.target_uuid)
-
-
-@app.post('/api/ble/oxi/retry')
-def api_oxi_retry():
-    return get_runtime().oxi_retry_wake()
-
-
 # ── Controller / snore config ─────────────────────────────────────────────
 
 @app.post('/api/controller/config')
@@ -303,11 +249,6 @@ def api_ctrl_cfg(req: CtrlCfgReq):
 def api_snore_cfg(req: SnoreCfgReq):
     return get_runtime().set_snore_config(
         {k: v for k, v in req.model_dump().items() if v is not None})
-
-
-@app.post('/api/snore/backend')
-def api_snore_backend(req: SnoreBackendReq):
-    return get_runtime().set_snore_backend(req.backend)
 
 
 # ── Audio devices ─────────────────────────────────────────────────────────
@@ -326,20 +267,11 @@ def api_audio_devices_set(req: AudioDevReq):
         set_output=req.set_output)
 
 
-@app.post('/api/audio/single-earbud')
-def api_audio_single_earbud(req: SingleEarbudReq):
-    return get_runtime().set_single_earbud_mode(
-        on=req.enabled,
-        preroll_s=req.preroll_s,
-        postroll_s=req.postroll_s)
-
-
 # ── Sessions ──────────────────────────────────────────────────────────────
 
 @app.post('/api/session/start')
 def api_session_start(req: SessionStartReq):
-    return get_runtime().session_start(
-        req.tag, req.subject, req.note, req.mode)
+    return get_runtime().session_start(req.tag, req.subject, req.note)
 
 
 @app.post('/api/session/stop')
@@ -374,8 +306,7 @@ def api_history_analyze(session_id: str):
 
 @app.get('/api/history/{session_id}/event_detail')
 def api_history_event_detail(session_id: str, base: str):
-    """Load one event's .npz and return the traces as JSON-friendly arrays.
-    `base` = the filename prefix (no extension), as given in session_detail."""
+    """Load one event's .npz and return the traces as JSON-friendly arrays."""
     import numpy as _np
     from fastapi.responses import JSONResponse
     p = get_runtime().session_event_file(session_id, base + '.npz')
@@ -394,14 +325,13 @@ def api_history_event_detail(session_id: str, base: str):
     def _pair(tk, vk, floatify=True):
         if tk not in d.files or vk not in d.files:
             return []
-        ts = d[tk].astype(float) - trigger_at     # relative seconds
+        ts = d[tk].astype(float) - trigger_at
         ys = d[vk].astype(float if floatify else None)
         return [[round(float(t), 3), float(y)]
                 for t, y in zip(ts.tolist(), ys.tolist())]
     out['chest'] = _pair('chest_t', 'chest_y')
     out['spo2'] = _pair('spo2_t', 'spo2_y')
     out['snore_prob'] = _pair('snore_t', 'snore_p')
-    # snore_flag carried as same time base as snore_p
     if 'snore_t' in d.files and 'snore_flag' in d.files:
         ts = d['snore_t'].astype(float) - trigger_at
         fl = d['snore_flag'].astype(bool)
@@ -412,16 +342,12 @@ def api_history_event_detail(session_id: str, base: str):
 
 @app.get('/api/history/{session_id}/event/{fname}')
 def api_history_event_file(session_id: str, fname: str):
-    from fastapi.responses import FileResponse
     p = get_runtime().session_event_file(session_id, fname)
     if p is None:
         raise HTTPException(status_code=404, detail='file not found')
-    # Choose a sensible Content-Type
     media = 'application/octet-stream'
     if fname.endswith('.wav'):
         media = 'audio/wav'
-    elif fname.endswith('.npz'):
-        media = 'application/octet-stream'
     elif fname.endswith('.json'):
         media = 'application/json'
     return FileResponse(str(p), media_type=media, filename=fname)

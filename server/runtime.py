@@ -1,16 +1,19 @@
 """
-OsaRuntime — all the non-GUI state/behavior from ui/designer.py extracted
-into a headless class the web server (and anyone else) can drive.
+OsaRuntime — headless runtime for the OSA experiment rig.
 
 Owns:
-  * EventBus, PostureAnalyzer, MicSnoreDetector, LocalAudioSink
-  * Chest band + oximeter BLE connections (shared background asyncio loop)
+  * EventBus, PostureAnalyzer, YamnetSnoreDetector, LocalAudioSink
+  * Chest band BLE connection (background asyncio loop)
   * Session recorder (optional, per session)
   * Closed-loop controller (optional, per session)
-  * Rolling buffers for plotting + quick snapshots
+  * Rolling buffers for plotting + per-trigger snapshots
+
+SpO2 / pulse rate come in through the chest band (HSRG variant relays the
+paired PC-68B pulse oximeter via BLE) — there is no separate BLE link to
+the oximeter in this build.
 
 Threading notes:
-  * All BLE work runs on a single dedicated asyncio loop in a bg thread.
+  * BLE work runs on a single dedicated asyncio loop in a bg thread.
   * EventBus callbacks can fire on any thread; handlers only mutate ivars.
   * Public methods are safe to call from the FastAPI request thread.
 """
@@ -27,20 +30,19 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import soundfile as sf
 
 from devices.chestband import ChestBandBLE
 from devices.chestband_protocol import DataPacket
-from devices.oximeter import OximeterBLE, OxiReading
 
 from pipeline import (
     EventBus, LocalAudioSink,
     SessionRecorder, SessionMeta, new_session_id,
     PostureAnalyzer, ClosedLoopController, ControllerConfig,
-    MicSnoreDetector, YamnetSnoreDetector,
+    YamnetSnoreDetector,
 )
 from pipeline.audio import PlaybackRequest
 from sounds.strategies import (
@@ -62,8 +64,6 @@ CHEST_FS = 25
 CHEST_BUF_MAX = CHEST_FS * CHEST_BUF_SECS
 
 # Long rolling buffers used for "±N seconds around trigger" snapshots.
-# We keep enough history to write out even if the subject crashes through
-# our response_window + no-response cooldown back into another trigger.
 CHEST_SNAPSHOT_BUF_S = 90       # 90 s chest resp waveform (@25 Hz ≈ 2250 pts)
 SPO2_SNAPSHOT_BUF_S = 300       # 5 min SpO2 @ ~1 Hz
 SNORE_SNAPSHOT_BUF_S = 300      # 5 min snoring probability @ 4 Hz
@@ -95,18 +95,10 @@ class OsaRuntime:
         self.bus = EventBus()
         self.audio_sink = LocalAudioSink()
         self.posture = PostureAnalyzer(self.bus)
-        # Prefer YAMNet (AudioSet-pretrained, includes Snoring class) when
-        # tensorflow is available; fall back to the heuristic detector so
-        # the rest of the stack still works on machines without TF.
-        self.snore_backend = 'heuristic'
-        if YamnetSnoreDetector is not None:
-            try:
-                self.snore = YamnetSnoreDetector(self.bus)
-                self.snore_backend = 'yamnet'
-            except Exception:
-                self.snore = MicSnoreDetector(self.bus)
-        else:
-            self.snore = MicSnoreDetector(self.bus)
+        if YamnetSnoreDetector is None:
+            raise RuntimeError(
+                "YAMNet detector unavailable — install tensorflow + tf-hub.")
+        self.snore = YamnetSnoreDetector(self.bus)
 
         # ── BLE: chest band ──
         self.ble: Optional[ChestBandBLE] = None
@@ -126,30 +118,15 @@ class OsaRuntime:
         # HSRG chest band relays SpO2 / PR / PPG from a paired PC-68B oximeter.
         # Track when we last saw a valid SpO2 / PR so UI can grey out stale
         # values (e.g. PC-68B off, finger out, out of range).
-        self._spo2_last_t: float = 0.0       # chest-band forwarded
-        self._pulse_last_t: float = 0.0      # chest-band forwarded
+        self._spo2_last_t: float = 0.0
+        self._pulse_last_t: float = 0.0
         self._chest_buf: list[float] = []
 
         # Rolling multi-channel buffers for trigger snapshots.
-        # Each entry is (timestamp_unix, value). deque with maxlen keeps it cheap.
         from collections import deque
         self._chest_hist = deque(maxlen=int(CHEST_FS * CHEST_SNAPSHOT_BUF_S))
-        self._spo2_hist = deque(maxlen=int(SPO2_SNAPSHOT_BUF_S * 2))   # ~2 Hz cap
-        self._snore_hist = deque(maxlen=int(SNORE_SNAPSHOT_BUF_S * 6)) # ~6 Hz cap
-
-        # ── BLE: oximeter ──
-        self.oxi: Optional[OximeterBLE] = None
-        self._oxi_connected = False
-        self._oxi_state = 'idle'
-        self._oxi_err = ''
-        self._oxi_pkt_count = 0
-        self._oxi_scan_busy = False
-        self._oxi_devices: list = []
-        self._oxi_latest: Optional[OxiReading] = None
-        self._oxi_latest_vals: dict = {'spo2': None, 'pulse': None, 'pi': None}
-        self._oxi_raw_frames: list[str] = []
-        self._oxi_log_lines: list[str] = []
-        self._oxi_write_uuids: list[str] = []
+        self._spo2_hist = deque(maxlen=int(SPO2_SNAPSHOT_BUF_S * 2))
+        self._snore_hist = deque(maxlen=int(SNORE_SNAPSHOT_BUF_S * 6))
 
         # ── Session / controller ──
         self.recorder: Optional[SessionRecorder] = None
@@ -164,17 +141,8 @@ class OsaRuntime:
             'ctrl_reason': '',
             'last_strategy': '',
             'last_direction': '',
-            'events': [],           # recent event log lines
+            'events': [],
         }
-        # Single-earbud duplex mode: close mic briefly before playing so
-        # AirPods can flip HFP→A2DP and actually deliver stereo. Default
-        # OFF — our preferred setup is Mac built-in mic + AirPods output.
-        self.single_earbud_mode: bool = False
-        # AirPods Pro actually needs ≈ 2.5 s to release the HFP session and
-        # flip to A2DP — 1.2 s was the old default and caused stereo to
-        # downmix to mono ringtone output. Raise it; still user-tunable.
-        self.single_earbud_preroll_s: float = 2.5
-        self.single_earbud_postroll_s: float = 0.4
 
         self._controller_cfg_values = {
             'trigger_hold_s': 8.0,
@@ -188,6 +156,7 @@ class OsaRuntime:
             'enabled': True,
             'require_snoring': True,
             'snoring_recent_s': 15.0,
+            'confirm_snore_bouts': 1,
             'active_window_start': '',
             'active_window_end': '',
         }
@@ -199,95 +168,12 @@ class OsaRuntime:
         self.bus.subscribe('intervention.response', self._on_response)
         self.bus.subscribe('intervention.error', self._on_intervention_error)
         self.bus.subscribe('chestband.data', self._on_chest_data)
-        self.bus.subscribe('oximeter.reading', self._on_oxi_reading)
         self.bus.subscribe('snore.state', self._on_snore_state)
         self.bus.subscribe('snore.state', self._on_snore_state_event)
         self._last_error = None  # {msg, t}
 
-        # Wire audio sink hooks for single-earbud mode (no-ops until
-        # single_earbud_mode is turned on).
-        self.audio_sink.before_play = self._audio_before_play
-        self.audio_sink.after_play = self._audio_after_play
-
         self._start_ble_loop()
         self.snore.start()
-
-    # ── single-earbud orchestration ──
-
-    def _se_duplex_active(self) -> bool:
-        """True iff a real HFP↔A2DP dance is actually needed.
-
-        Heuristic: the mic either (a) shares the same device index as the
-        output, or (b) looks like a Bluetooth device by name. In any other
-        case the mic is a separate physical stream (e.g. Mac built-in mic)
-        and there is no profile conflict to manage — so preroll/postroll
-        would just be a pointless mic blackout.
-        """
-        if not self.single_earbud_mode:
-            return False
-        in_dev = self.snore.device
-        out_dev = self.audio_sink.device
-        if in_dev is not None and in_dev == out_dev:
-            return True
-        try:
-            in_name = self._device_name(in_dev, direction='input') or ''
-        except Exception:
-            in_name = ''
-        needles = ('airpods', 'bluetooth', '蓝牙', 'bt')
-        lo = in_name.lower()
-        return any(n in lo for n in needles)
-
-    def _device_name(self, idx, direction: str = 'input') -> Optional[str]:
-        """Resolve a device index to a name via sounddevice (best-effort)."""
-        try:
-            import sounddevice as sd
-            info = sd.query_devices(idx if idx is not None else None)
-            return info.get('name')
-        except Exception:
-            return None
-
-    def _audio_before_play(self, req):
-        """If single-earbud mode is on AND the mic really shares the BT link
-        with the output, stop the mic long enough for AirPods to flip
-        HFP→A2DP. Otherwise no-op (avoids pointless mic blackouts).
-
-        HFP→A2DP on AirPods Pro is NOT automatic. CoreAudio holds the HFP
-        session a while after InputStream.close(), so we:
-
-        1. Stop the mic stream.
-        2. Tear PortAudio down and re-init it. This drops CoreAudio's
-           cached device handles and signals "nothing is holding HFP".
-        3. Sleep preroll_s (default 2.5 s on AirPods Pro, empirically
-           the minimum for reliable flip). User-tunable in the UI.
-        """
-        if not self._se_duplex_active():
-            self._live['_se_was_listening'] = False
-            return
-        try:
-            was_listening = getattr(self.snore, 'status', '') == 'listening'
-            self._live['_se_was_listening'] = was_listening
-            if was_listening:
-                self.snore.stop()
-            try:
-                import sounddevice as sd
-                sd._terminate(); sd._initialize()
-            except Exception:
-                pass
-            time.sleep(self.single_earbud_preroll_s)
-        except Exception:
-            self._live['_se_was_listening'] = False
-
-    def _audio_after_play(self, req):
-        """Bring the mic back online after playback is done."""
-        if not self._live.get('_se_was_listening'):
-            return
-        try:
-            time.sleep(self.single_earbud_postroll_s)
-            self.snore.start()
-        except Exception:
-            pass
-        finally:
-            self._live['_se_was_listening'] = False
 
     # ────────────────────────────────────────────────────────────── BLE loop
 
@@ -389,10 +275,6 @@ class OsaRuntime:
         if 70 <= (v.spo2_pct or 0) <= 100:
             lv['spo2'] = v.spo2_pct
             self._spo2_last_t = now_t
-            # Feed chest-band-forwarded SpO2 into the history buffer that the
-            # trigger-snapshot writer pulls from. Previously only the direct
-            # PC-68B BLE path wrote here; experiments show this relay path is
-            # where SpO2 actually comes from on HSRG-variant chest bands.
             self._spo2_hist.append((now_t, float(v.spo2_pct)))
         if 30 <= (v.pulse_rate or 0) <= 220:
             lv['pulse'] = v.pulse_rate
@@ -409,34 +291,22 @@ class OsaRuntime:
             self._chest_buf.extend([float(x) for x in dp.chest_resp])
             if len(self._chest_buf) > CHEST_BUF_MAX:
                 self._chest_buf = self._chest_buf[-CHEST_BUF_MAX:]
-            # Rolling history for trigger snapshots: timestamp each sample
-            # evenly spaced at CHEST_FS (25 Hz) up to ev.t.
             base_t = float(ev.t)
             n = len(dp.chest_resp)
             for i, y in enumerate(dp.chest_resp):
                 sample_t = base_t - (n - 1 - i) / CHEST_FS
                 self._chest_hist.append((sample_t, float(y)))
 
-    def _on_oxi_reading(self, ev):
-        r = ev.payload
-        val = getattr(r, 'spo2_pct', None)
-        if val is not None and val > 0:
-            self._spo2_hist.append((float(ev.t), float(val)))
-
     def _on_snore_state(self, ev):
         p = ev.payload or {}
-        prob = p.get('snoring_prob')
-        if prob is None:
-            # Heuristic backend: synthesize a pseudo-prob from energy
-            e = p.get('energy_db', -80)
-            prob = max(0.0, min(1.0, (e + 80) / 60))
+        prob = p.get('snoring_prob', 0.0)
         self._snore_hist.append((float(ev.t), float(prob),
                                  bool(p.get('snoring', False))))
 
     # ──────────────────────────────────────────────────────── Public state
 
     def snapshot(self) -> dict:
-        """One dict the web UI reads each tick / on state_request."""
+        """One dict the web UI reads each tick."""
         buf = np.asarray(self._chest_buf, dtype=np.float32)
         step = max(1, len(buf) // 200)
         chest_plot = buf[::step].tolist() if len(buf) > 0 else []
@@ -446,8 +316,7 @@ class OsaRuntime:
         sn = self.snore.metrics()
         sess_dur = (time.time() - self.session_start_t) if self.recorder else 0.0
 
-        # SpO2 freshness: values older than 5 s are considered stale (PC-68B
-        # likely off, finger out, or chest band dropped the relay).
+        # SpO2 freshness: values older than 5 s are considered stale.
         STALE_S = 5.0
         now_t = time.time()
         vitals_out = dict(self._ble_latest_vitals)
@@ -459,8 +328,8 @@ class OsaRuntime:
             vitals_out['spo2'] = None
         if pulse_stale:
             vitals_out['pulse'] = None
-        # If firmware never computes resp_rate (seen on HSRG variant), fall
-        # back to our own peak-based estimate from the chest respiration wave.
+        # If firmware never computes resp_rate (HSRG variant), fall back to
+        # our own peak-based estimate from the chest respiration wave.
         if vitals_out.get('resp') is None and chest_rr and chest_rr > 0:
             vitals_out['resp'] = round(float(chest_rr), 1)
 
@@ -474,36 +343,17 @@ class OsaRuntime:
                 'chest_t': chest_t,
                 'chest_y': chest_plot,
                 'chest_rr': chest_rr,
-                # HSRG variant has no own PPG — SpO2/PR/PPG arrive as a
-                # relayed payload from a paired PC-68B oximeter.
                 'spo2_source': 'relay_pc68b',
                 'spo2_stale': bool(spo2_stale),
                 'spo2_age_s': None if spo2_age is None else round(spo2_age, 1),
                 'pulse_stale': bool(pulse_stale),
             },
-            'oximeter': {
-                'state': self._oxi_state,
-                'err': self._oxi_err,
-                'pkt': self._oxi_pkt_count,
-                'vals': dict(self._oxi_latest_vals),
-                'flags': self._oxi_flags(),
-                'raw_tail': self._oxi_raw_frames[-20:],
-                'log_tail': self._oxi_log_lines[-40:],
-                'write_uuids': list(self._oxi_write_uuids),
-            },
             'snore': sn,
-            'snore_backend': self.snore_backend,
             'audio': {
                 'input_device': self.snore.device,
                 'output_device': self.audio_sink.device,
-                'input_name': self._device_name(self.snore.device,
-                                                direction='input'),
-                'output_name': self._device_name(self.audio_sink.device,
-                                                 direction='output'),
-                'single_earbud_mode': self.single_earbud_mode,
-                'single_earbud_active': self._se_duplex_active(),
-                'single_earbud_preroll_s': self.single_earbud_preroll_s,
-                'single_earbud_postroll_s': self.single_earbud_postroll_s,
+                'input_name': self._device_name(self.snore.device),
+                'output_name': self._device_name(self.audio_sink.device),
             },
             'posture': {
                 'cls': self._live['posture'],
@@ -528,14 +378,20 @@ class OsaRuntime:
             'last_error': self._last_error,
         }
 
+    def _device_name(self, idx) -> Optional[str]:
+        try:
+            import sounddevice as sd
+            info = sd.query_devices(idx if idx is not None else None)
+            return info.get('name')
+        except Exception:
+            return None
+
     def _controller_snapshot(self) -> dict:
-        """Build a fat controller snapshot the UI can drive a big status
-        banner off of. Tells you exactly why (or why not) a trigger would
-        fire *right now* — so you never have to guess."""
+        """Build a fat controller snapshot the UI can drive a status banner
+        off of. Tells you why (or why not) a trigger would fire right now."""
         cfg = dict(self._controller_cfg_values)
         posture = self._live['posture']
         posture_ok = posture in ('supine',)
-        # YAMNet / heuristic both expose is_snoring()
         try:
             snore_now = bool(self.snore.is_snoring())
         except Exception:
@@ -552,8 +408,6 @@ class OsaRuntime:
                       'active_window_start': cfg.get('active_window_start',''),
                       'active_window_end': cfg.get('active_window_end',''),
                       })
-        # For the UI banner: "snoring side satisfied" is the same predicate
-        # the controller uses — snore_now OR recent-enough.
         recent_s = float(stat.get('snoring_recent_s',
                                   cfg.get('snoring_recent_s', 15.0)))
         age = stat.get('snoring_age_s')
@@ -566,8 +420,6 @@ class OsaRuntime:
         state = stat.get('state', self._live['ctrl_state'])
         armed_dur = float(stat.get('armed_duration', 0.0))
         cooldown_left = float(stat.get('cooldown_left', 0.0))
-        # Use the *effective* hold (retry or first) so the UI progress bar
-        # fills at the right rate when the controller is retrying.
         hold_s = float(stat.get('effective_trigger_hold_s',
                                 cfg['trigger_hold_s']))
 
@@ -625,17 +477,6 @@ class OsaRuntime:
                 'retry_trigger_hold_s',
                 cfg.get('retry_trigger_hold_s', 2.0))),
         }
-
-    def _oxi_flags(self) -> List[str]:
-        r = self._oxi_latest
-        if r is None:
-            return []
-        f = []
-        if getattr(r, 'finger_out', False):
-            f.append('手指未插入')
-        if getattr(r, 'probe_error', False):
-            f.append('探头异常')
-        return f
 
     @staticmethod
     def _estimate_rr(buf: np.ndarray, fs: float = 25.0) -> float:
@@ -741,141 +582,6 @@ class OsaRuntime:
         self._submit(_do())
         return {'ok': True}
 
-    # ────────────────────────────────────────────── Oximeter BLE operations
-
-    def oxi_scan(self, named_only=True, oximeter_only=True,
-                 timeout=8.0) -> dict:
-        if self._oxi_scan_busy:
-            return {'ok': False, 'err': 'already scanning'}
-        self._oxi_scan_busy = True
-
-        async def _do():
-            try:
-                named = bool(named_only) or bool(oximeter_only)
-                pairs = await OximeterBLE.scan(
-                    timeout=timeout,
-                    named_only=named,
-                    oximeter_only=bool(oximeter_only))
-                self._oxi_devices = pairs
-            except Exception as e:
-                self._oxi_err = f'scan: {e}'
-                self._oxi_devices = []
-            finally:
-                self._oxi_scan_busy = False
-
-        fut = self._submit(_do())
-        if fut is not None:
-            try:
-                fut.result(timeout=timeout + 3.0)
-            except Exception:
-                pass
-        return {'ok': True, 'devices': [{
-            'name': dev.name or '(unknown)',
-            'address': dev.address,
-            'rssi': rssi,
-        } for dev, rssi in self._oxi_devices]}
-
-    def oxi_connect(self, address: str) -> dict:
-        if self._oxi_connected or self._oxi_state == 'connecting':
-            return {'ok': False, 'err': 'already connected/connecting'}
-        device = None
-        for dev, _ in self._oxi_devices:
-            if dev.address == address:
-                device = dev
-                break
-        if device is None:
-            return {'ok': False, 'err': 'address not in latest scan'}
-
-        self._oxi_state = 'connecting'
-        self._oxi_err = ''
-
-        async def _do():
-            try:
-                self.oxi = OximeterBLE()
-                self._oxi_pkt_count = 0
-                self._oxi_raw_frames = []
-                self._oxi_log_lines = []
-
-                def _on_reading(r: OxiReading):
-                    self._oxi_latest = r
-                    if r.spo2_pct is not None and r.spo2_pct > 0:
-                        self._oxi_latest_vals['spo2'] = r.spo2_pct
-                    if r.pulse_rate is not None and r.pulse_rate > 0:
-                        self._oxi_latest_vals['pulse'] = r.pulse_rate
-                    if r.pi is not None and r.pi > 0:
-                        self._oxi_latest_vals['pi'] = round(float(r.pi), 1)
-                    try:
-                        self.bus.emit('oximeter.reading', r, src='oximeter')
-                    except Exception:
-                        pass
-
-                def _on_raw(b: bytes):
-                    self._oxi_pkt_count += 1
-                    self._oxi_raw_frames.append(b.hex(' '))
-                    if len(self._oxi_raw_frames) > 80:
-                        self._oxi_raw_frames = self._oxi_raw_frames[-80:]
-
-                def _on_log(msg: str):
-                    for line in msg.splitlines():
-                        self._oxi_log_lines.append(line)
-                    if len(self._oxi_log_lines) > 80:
-                        self._oxi_log_lines = self._oxi_log_lines[-80:]
-
-                self.oxi.on_reading = _on_reading
-                self.oxi.on_raw_frame = _on_raw
-                self.oxi.on_log = _on_log
-                await self.oxi.connect(device)
-                await self.oxi.start_receiving()
-                self._oxi_write_uuids = self.oxi.list_write_uuids()
-                self._oxi_connected = True
-                self._oxi_state = 'connected'
-            except Exception as e:
-                self._oxi_connected = False
-                self._oxi_state = 'error'
-                self._oxi_err = str(e)
-
-        self._submit(_do())
-        return {'ok': True}
-
-    def oxi_disconnect(self) -> dict:
-        self._oxi_connected = False
-        self._oxi_state = 'idle'
-
-        async def _do():
-            try:
-                if self.oxi:
-                    await self.oxi.disconnect()
-            except Exception:
-                pass
-
-        self._submit(_do())
-        return {'ok': True}
-
-    def oxi_manual_send(self, hex_str: str, target_uuid: Optional[str] = None):
-        if not self._oxi_connected or self.oxi is None:
-            return {'ok': False, 'err': 'not connected'}
-        try:
-            bytes.fromhex(hex_str.replace(' ', '').replace(',', ''))
-        except Exception as e:
-            return {'ok': False, 'err': f'hex parse: {e}'}
-
-        async def _run():
-            await self.oxi.write_raw(
-                hex_str, target_uuid=target_uuid, with_response=False)
-
-        self._submit(_run())
-        return {'ok': True}
-
-    def oxi_retry_wake(self):
-        if not self._oxi_connected or self.oxi is None:
-            return {'ok': False, 'err': 'not connected'}
-
-        async def _run():
-            await self.oxi._send_start_command()
-
-        self._submit(_run())
-        return {'ok': True}
-
     # ────────────────────────────────────────────── Controller / sessions
 
     def set_controller_config(self, patch: dict) -> dict:
@@ -889,6 +595,8 @@ class OsaRuntime:
         for k in ('enabled', 'require_snoring'):
             if k in patch:
                 v[k] = bool(patch[k])
+        if 'confirm_snore_bouts' in patch:
+            v['confirm_snore_bouts'] = max(0, int(patch['confirm_snore_bouts']))
         for k in ('active_window_start', 'active_window_end'):
             if k in patch:
                 v[k] = str(patch[k] or '').strip()
@@ -907,6 +615,7 @@ class OsaRuntime:
             retry_trigger_hold_s=v.get('retry_trigger_hold_s', 2.0),
             retry_reset_idle_s=v.get('retry_reset_idle_s', 30.0),
             snoring_recent_s=v['snoring_recent_s'],
+            confirm_snore_bouts=int(v.get('confirm_snore_bouts', 1)),
             strategy_pool=('P1', 'P2', 'P3'),
             direction_policy='opposite',
             level_db=v['level_db'],
@@ -921,13 +630,9 @@ class OsaRuntime:
     # ── Audio device selection ──
 
     def list_audio_devices(self) -> dict:
-        """Enumerate sounddevice devices (fresh view of CoreAudio).
-
-        PortAudio caches the device list at process start, so BT devices
-        that pair later (AirPods) are invisible to the main process even
-        after `Pa_Terminate/Pa_Initialize`. Work around it by shelling out
-        to a short-lived Python subprocess — every call gets a pristine
-        CoreAudio snapshot without disturbing our live InputStream.
+        """Enumerate sounddevice devices via a short-lived subprocess so
+        BT devices that pair after process start (AirPods etc.) become
+        visible without disturbing our live InputStream.
         """
         raw, default_in, default_out, err = self._query_devices_subprocess()
         if err:
@@ -993,21 +698,6 @@ class OsaRuntime:
         except Exception as e:
             return [], None, None, str(e)
 
-    def set_single_earbud_mode(self, on: bool,
-                               preroll_s: Optional[float] = None,
-                               postroll_s: Optional[float] = None) -> dict:
-        self.single_earbud_mode = bool(on)
-        if preroll_s is not None:
-            self.single_earbud_preroll_s = max(0.3, float(preroll_s))
-        if postroll_s is not None:
-            self.single_earbud_postroll_s = max(0.0, float(postroll_s))
-        return {
-            'ok': True,
-            'enabled': self.single_earbud_mode,
-            'preroll_s': self.single_earbud_preroll_s,
-            'postroll_s': self.single_earbud_postroll_s,
-        }
-
     def set_audio_devices(self, input_device=None, output_device=None,
                           set_input: bool = False,
                           set_output: bool = False) -> dict:
@@ -1035,84 +725,26 @@ class OsaRuntime:
 
     def set_snore_config(self, patch: dict) -> dict:
         kwargs = {}
-        if 'energy_db' in patch:
-            kwargs['energy_db'] = patch['energy_db']
-        if 'band_ratio_min' in patch:
-            kwargs['band_ratio_min'] = patch['band_ratio_min']
         if 'snore_prob_thresh' in patch:
             kwargs['snore_prob_thresh'] = patch['snore_prob_thresh']
-        try:
-            self.snore.set_thresholds(**kwargs)
-        except TypeError:
-            # Heuristic set_thresholds rejects snore_prob_thresh kwarg.
-            kwargs.pop('snore_prob_thresh', None)
-            self.snore.set_thresholds(**kwargs)
+        self.snore.set_thresholds(**kwargs)
         cfg = {
-            'energy_db': getattr(self.snore, 'energy_db', None),
-            'band_ratio_min': getattr(self.snore, 'band_ratio_min', None),
             'snore_prob_thresh': getattr(self.snore,
                                          'snore_prob_thresh', None),
         }
-        return {'ok': True, 'config': cfg, 'backend': self.snore_backend}
+        return {'ok': True, 'config': cfg}
 
-    def set_snore_backend(self, backend: str) -> dict:
-        """Swap detector while keeping the input device and listening state.
-        Accepts 'yamnet' or 'heuristic'. Returns the active backend (may be
-        unchanged on failure).
-        """
-        backend = (backend or '').lower()
-        if backend == self.snore_backend:
-            return {'ok': True, 'backend': self.snore_backend,
-                    'note': 'already active'}
-        if backend not in ('yamnet', 'heuristic'):
-            return {'ok': False, 'err': f'unknown backend: {backend}'}
-
-        prev_device = getattr(self.snore, 'device', None)
-        try:
-            self.snore.stop()
-        except Exception:
-            pass
-
-        if backend == 'yamnet':
-            if YamnetSnoreDetector is None:
-                return {'ok': False, 'err': 'tensorflow/tf-hub 未安装',
-                        'backend': self.snore_backend}
-            try:
-                new_snore = YamnetSnoreDetector(self.bus, device=prev_device)
-            except Exception as e:
-                return {'ok': False, 'err': f'init yamnet: {e}',
-                        'backend': self.snore_backend}
-        else:
-            new_snore = MicSnoreDetector(self.bus, device=prev_device)
-
-        self.snore = new_snore
-        self.snore_backend = backend
-        # Rewire the closed-loop controller's snoring provider if a session
-        # is currently active — otherwise it's still pointing at the old
-        # detector's `is_snoring` method.
-        if self.controller is not None:
-            self.controller.snoring_provider = self.snore.is_snoring
-        self.snore.start()
-        return {'ok': True, 'backend': self.snore_backend,
-                'status': self.snore.status, 'err': self.snore.error}
-
-    def session_start(self, tag='', subject='', note='', mode='A') -> dict:
+    def session_start(self, tag='', subject='', note='') -> dict:
         if self.recorder is not None:
             return {'ok': False, 'err': 'session already running'}
-        mode = (mode or 'A').upper()
-        if mode not in ('A', 'B'):
-            return {'ok': False, 'err': f'unknown mode: {mode}'}
-        if mode == 'B':
-            return {'ok': False,
-                    'err': 'Block B 尚未实现 (controller 仅支持 A)'}
         sid = new_session_id(tag.strip())
         meta = SessionMeta(
             session_id=sid,
             started_at=datetime.now().isoformat(timespec='seconds'),
             subject_id=subject.strip(),
             note=note.strip(),
-            protocol=f'block_{mode.lower()}_pilot',
-            mode=mode,
+            protocol='block_a_pilot',
+            mode='A',
             config=asdict(self._build_cfg()),
         )
         self.recorder = SessionRecorder(self.bus, meta)
@@ -1124,7 +756,7 @@ class OsaRuntime:
         self.bus.emit('session.marker', {'kind': 'start', 'session': sid},
                       src='web')
         self._live['events'] = []
-        self._push_event(f">> 会话开始 · Block {mode} · 受试 "
+        self._push_event(f">> 会话开始 · 受试 "
                          f"{subject.strip() or '-'}  · id {sid}")
         return {'ok': True, 'session_id': sid}
 
@@ -1186,7 +818,7 @@ class OsaRuntime:
                             spo2_before_s: float = 30.0,
                             spo2_after_s: float = 60.0):
         """After each trigger, dump a ±N s multi-channel snapshot:
-            sessions/<id>/events/<YYYYMMDD_HHMMSS>_<A|B>_<strategy>_<dir>.npz
+            sessions/<id>/events/<YYYYMMDD_HHMMSS>_A_<strategy>_<dir>.npz
             sessions/<id>/events/<same>_mic.wav        (mic around trigger)
             sessions/<id>/events/<same>_played.wav     (the intervention we played)
         Everything is timestamped relative to `trigger_at` (unix seconds).
@@ -1199,13 +831,10 @@ class OsaRuntime:
         ev_dir.mkdir(parents=True, exist_ok=True)
         block = self.recorder.meta.mode
 
-        # Copy the last synthesized / played wave so the worker can write
-        # it out even if the controller starts the next one shortly after.
         played_wave = getattr(self.audio_sink, 'last_wave', None)
         played_sr = int(getattr(self.audio_sink, 'last_sample_rate', 0) or 0)
 
         def _slice_hist(hist, t0, t1, with_flag=False):
-            """Return two parallel np.ndarrays for t and v within [t0,t1]."""
             ts_out, v_out, f_out = [], [], []
             for row in list(hist):
                 if with_flag:
@@ -1222,7 +851,6 @@ class OsaRuntime:
             return np.asarray(ts_out), np.asarray(v_out)
 
         def _do():
-            # Wait the longest "after" window so buffers are filled.
             tail = max(chest_after_s, mic_after_s, spo2_after_s) + 0.2
             time.sleep(tail)
             try:
@@ -1230,8 +858,6 @@ class OsaRuntime:
                     '%Y%m%d_%H%M%S')
                 base = f"{ts_str}_{block}_{strategy}_{direction or 'center'}"
 
-                # Mic audio ± around trigger. snore.snapshot returns the
-                # most recent N seconds, so we pull *after* the tail sleep.
                 span = mic_before_s + mic_after_s
                 try:
                     wav = self.snore.snapshot(span + 0.2)
@@ -1241,12 +867,10 @@ class OsaRuntime:
                     sf.write(str(ev_dir / f"{base}_mic.wav"),
                              wav, self.snore.sr)
 
-                # Played intervention wav.
                 if played_wave is not None and played_sr > 0:
                     sf.write(str(ev_dir / f"{base}_played.wav"),
                              played_wave, int(played_sr))
 
-                # Chest resp ±30s + SpO2 ±60s + snoring_prob ±30s → npz.
                 chest_t, chest_y = _slice_hist(
                     self._chest_hist,
                     trigger_at - chest_before_s, trigger_at + chest_after_s)
@@ -1322,7 +946,6 @@ class OsaRuntime:
             w = self.synth_wave(strategy, params, direction)
         except Exception as e:
             return {'ok': False, 'err': str(e)}
-        # Downsample to ~2000 pts for plotting
         n = len(w)
         step = max(1, n // 2000)
         t_ms = (np.arange(0, n, step) / DEFAULT_SR * 1000.0).tolist()
@@ -1474,10 +1097,6 @@ class OsaRuntime:
     # ── Replay: session detail + per-event bundle ──
 
     def session_detail(self, session_id: str) -> dict:
-        """Everything a replay UI needs for one session:
-        meta.json, all interventions (paired with responses), and a list of
-        available event snapshot files under events/.
-        """
         sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
         d = SESSIONS_DIR / sid
         if not d.is_dir():
@@ -1518,7 +1137,6 @@ class OsaRuntime:
         except Exception:
             pass
 
-        # Pair responses
         responses = []
         try:
             if (d / 'events.jsonl').exists():
@@ -1583,14 +1201,11 @@ class OsaRuntime:
     def session_event_file(session_id: str, fname: str) -> Optional[Path]:
         """Validate and return the absolute path of an event asset."""
         sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
-        # Defensive: prevent .. path escape.
         safe_name = Path(fname).name
         p = SESSIONS_DIR / sid / 'events' / safe_name
         return p if p.is_file() else None
 
     def run_session_analysis(self, session_id: str) -> dict:
-        """Invoke scripts/analyze_night.py on one session and return the
-        resulting summary payload (so the UI can trigger it on demand)."""
         sid = ''.join(c for c in session_id if c.isalnum() or c in '-_')
         d = SESSIONS_DIR / sid
         if not d.is_dir():
@@ -1622,10 +1237,6 @@ class OsaRuntime:
                 fut = self._submit(self.ble.disconnect())
                 if fut:
                     fut.result(timeout=2.0)
-            if self._oxi_connected and self.oxi:
-                fut = self._submit(self.oxi.disconnect())
-                if fut:
-                    fut.result(timeout=2.0)
         except Exception:
             pass
         try:
@@ -1635,7 +1246,6 @@ class OsaRuntime:
             pass
 
 
-# Process-wide singleton (lazily initialized by the web app)
 _runtime_lock = threading.Lock()
 _runtime: Optional[OsaRuntime] = None
 

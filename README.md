@@ -4,6 +4,8 @@
 把蓝牙胸带、血氧仪、YAMNet 实时打鼾检测、定向空间音效干预器串成闭环，
 夜间自动触发、落盘所有原始信号和干预事件、次日一键生成分析报告。
 
+> **🚀 想直接跑一晚？** 看 **[USAGE.md](USAGE.md)** —— 一份给所有人（被试 / 协作者 / 研究员）的简明操作指南，全程双击三个 `.command` 文件。
+
 ```
   ┌────────────────┐  光学 PPG     ┌────────────────┐   BLE (1A2.0)    ┌───────────────┐
   │ PC-68B 血氧仪   ├─ SpO2/PR ───▶│  HSR 1A2 胸带  ├─────────────────▶│ 姿态/呼吸/SpO2 │
@@ -22,7 +24,7 @@
                                       │            └────────┬─────────┘
                                       │                     │
                                       │            ┌────────▼─────────┐
-                                      │            │  AirPods / 扬声器 │
+                                      │            │  耳机 / 扬声器     │
                                       │            └──────────────────┘
                                       │
                                       └───▶ SessionRecorder ──▶ sessions/<id>/
@@ -31,8 +33,7 @@
 ## 亮点
 
 - **实时打鼾检测**：Google [YAMNet](https://tfhub.dev/google/yamnet/1) 预训练模型
-  （AudioSet 521 类里的 **Snoring**），Apple Silicon Metal GPU 加速；
-  TensorFlow 未装时自动回退到 RMS + 80–500 Hz 带能比的启发式实现。
+  （AudioSet 521 类里的 **Snoring**），Apple Silicon Metal GPU 加速。
 - **双声道方向干预**：5 种策略 P1/P2/P3（带 ITD/ILD 空间化，左右耳差异）+
   L1/L2（居中短声，留给后续 Block B 截断鼾声）。
 - **完整状态机**：仰卧 ∧ 最近有鼾声 → 计时 8 秒 → 触发 → 播放 → 10 秒观察 →
@@ -60,18 +61,11 @@ python3 run_designer.py --web
 ```
 
 > ⚠️ 首次启动会从 TF Hub 下载 YAMNet 模型（约 17 MB），大概 10 秒。
-> 没有网络 / 装不上 TensorFlow 时系统会自动回退到启发式鼾声检测，Block A
-> 主流程仍可用。
+> 必须装好 TensorFlow（macOS 上推荐 `tensorflow-macos` + `tensorflow-metal`），
+> 否则进程会拒绝启动。
 
-**有被试、要真的跑一晚**：看 [`dist/README.md`](dist/README.md)，里面是给非
-技术背景被试的一键脚本包（双击 `.command` 即可）。
-
-## 两种运行模式
-
-| 模式 | 入口 | 用途 |
-|------|------|------|
-| **Web 控制台**（推荐）| `python3 run_designer.py --web` | 跨平台浏览器，含回放/审核 Tab |
-| DearPyGui 桌面版（legacy）| `python3 run_designer.py` | 保留的桌面原型，功能不再扩展 |
+**要真的跑一晚（被试 / 任何非开发者）**：看 [`USAGE.md`](USAGE.md)，
+全程双击 `dist/` 里的三个 `.command` 文件即可，不用碰命令行。
 
 ## 目录结构
 
@@ -85,27 +79,24 @@ osa-rig/
 ├── docs/                      设计与协议文档（给 reviewer 看）
 │   ├── architecture.md        系统总览 & 线程/数据流模型
 │   ├── block_a_pipeline.md    Block A 状态机 & 时间轴示例
-│   ├── snore_detection.md     YAMNet 后端 / 启发式回退 / 调参指南
+│   ├── snore_detection.md     YAMNet 后端 & 调参
 │   ├── sound_strategies.md    5 种声学策略 & 合成参数
 │   ├── data_format.md         sessions/<id>/ 里每个文件是什么
-│   ├── airpods_duplex.md      单耳机收放音方案分析
 │   ├── roadmap.md             Block B / OSA 事件检测 / PPO 远期路线图
 │   └── protocols/
 │       ├── chestband_1a2.md   1A2.0 数据帧格式速查
-│       └── oximeter_pc68b.md  PC-68B（可选）协议笔记
+│       └── oximeter_pc68b.md  PC-68B 角色说明（不单独连）
 │
 ├── devices/                   BLE 驱动层
 │   ├── chestband.py           胸带 BleakClient 封装
-│   ├── chestband_protocol.py  1A2.0 帧解析
-│   └── oximeter.py            PC-68B 驱动
+│   └── chestband_protocol.py  1A2.0 帧解析
 │
 ├── pipeline/                  核心流水线（独立于 UI）
 │   ├── events.py              发布-订阅 EventBus
 │   ├── sensors.py             抽象 Sensor 协议
 │   ├── posture.py             姿态分类 + debounce
-│   ├── snore.py               启发式鼾声检测（后备）
-│   ├── snore_yamnet.py        YAMNet 鼾声检测（主力）
-│   ├── audio.py               AudioSink（含单耳机 duplex hook）
+│   ├── snore_yamnet.py        YAMNet 鼾声检测
+│   ├── audio.py               AudioSink (sounddevice 输出)
 │   ├── recorder.py            SessionRecorder
 │   └── controller.py          Block A 闭环控制器（状态机）
 │
@@ -123,20 +114,17 @@ osa-rig/
 │   ├── app.js
 │   └── styles.css
 │
-├── ui/                        桌面版（legacy，保留兼容）
-│   └── designer.py
-│
 ├── scripts/                   离线工具
-│   ├── tune_snore.py          用真实 WAV 调鼾声阈值
 │   ├── analyze_night.py       一晚数据汇总 → 策略对比表
 │   └── test_chestband.py      胸带解析自测
 │
-├── dist/                      给非技术被试的一键分发包
-│   ├── setup.command
-│   ├── preflight_check.command
-│   ├── start_night.command
-│   ├── end_night.command
-│   └── README.md
+├── dist/                      被试用的一键脚本（双击运行）
+│   ├── setup.command          首次安装
+│   ├── preflight_check.command  开夜前自检（可选）
+│   ├── start_night.command    每晚开始
+│   └── end_night.command      早上结束 + 打包数据
+│
+├── USAGE.md                   ★ 给所有非开发者的操作指南
 │
 └── tests/                     基础 smoke 测试
     └── test_smoke.py

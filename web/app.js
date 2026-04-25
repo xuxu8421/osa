@@ -1,9 +1,6 @@
 /* OSA experiment console — single-file Vue 3 app (no build step). */
 
-const { createApp, h } = Vue;
-
-const STRATEGY_COLORS = { P1: '#38bdf8', P2: '#a78bfa', P3: '#f472b6',
-                          L1: '#22c55e', L2: '#f59e0b' };
+const { createApp } = Vue;
 
 function cls(...xs) { return xs.filter(Boolean).join(' '); }
 function fmt(n, d = 1) { return (n === null || n === undefined) ? '—' : Number(n).toFixed(d); }
@@ -52,30 +49,24 @@ const App = {
       presetSel: '',
       // devices
       chestScan: { devices: [], busy: false,
-                   addr: '', namedOnly: true, chestbandOnly: false },
-      oxiScan: { devices: [], busy: false,
-                 addr: '', namedOnly: true, oximeterOnly: true },
+                   addr: '', namedOnly: true, chestbandOnly: true },
       audioDevs: { inputs: [], outputs: [], loading: false,
                    inputSel: '', outputSel: '' },
+      showChestPanel: true,
       // experiment
-      sessionForm: { tag: '', subject: '', note: '', mode: 'A' },
+      sessionForm: { tag: '', subject: '', note: '' },
       showCtrlCfg: false,
       showSnoreCfg: false,
       yamnetThresh: 0.3,
-      backendBusy: false,
-      history: [],
-      // debug
-      oxiHex: '',
-      oxiTarget: '',
       // replay
+      historyList: [],
       replaySelectedId: '',
       replayDetail: null,
-      replayActive: null,       // {event, traces}
+      replayActive: null,
       replayLoading: false,
       // charts
       previewChart: null,
       chestChart: null,
-      // last ~90s of snore probability for the timeline (SVG) chart
       snoreHist: [],
       ticker: 0,
     };
@@ -96,32 +87,21 @@ const App = {
       const d = this.audioDevs.outputs.find(x => x.index === idx);
       return d ? `[${idx}] ${d.name}` : `#${idx}`;
     },
-    hasAirPodsOutput() {
-      const re = /airpods|蓝牙|bluetooth/i;
-      return this.audioDevs.outputs.some(d => re.test(d.name));
-    },
     snoreDetail() {
       const s = this.snap?.snore;
       if (!s) return '';
-      if (s.backend === 'yamnet') {
-        return `Snoring ${fmt(s.snoring_prob, 2)} · Breathing ${fmt(s.breathing_prob, 2)}` +
-          ` · Speech ${fmt(s.speech_prob, 2)} · top=${s.top_class || '—'}`;
-      }
-      return `能量 ${fmt(s.energy_db, 1)} dB · 带能比 ${fmt(s.band_ratio, 2)}`;
+      return `Snoring ${fmt(s.snoring_prob, 2)} · Breathing ${fmt(s.breathing_prob, 2)}` +
+        ` · Speech ${fmt(s.speech_prob, 2)} · top=${s.top_class || '—'}`;
     },
-    // SVG timeline: project last 90s onto [0..W] (W=1000 viewBox units),
-    // probability 0..1 → y H..0 (H=200 viewBox units).
     replayChestYMin() {
       const t = this.replayActive?.traces?.chest;
       if (!t || !t.length) return -1;
-      const vs = t.map(p => p[1]);
-      return Math.min(...vs);
+      return Math.min(...t.map(p => p[1]));
     },
     replayChestYMax() {
       const t = this.replayActive?.traces?.chest;
       if (!t || !t.length) return 1;
-      const vs = t.map(p => p[1]);
-      return Math.max(...vs);
+      return Math.max(...t.map(p => p[1]));
     },
     snoreView() {
       const W = 1000, H = 200, WINDOW_S = 90;
@@ -129,7 +109,7 @@ const App = {
       if (!n) return null;
       const now = this.snoreHist[n - 1].t;
       const pts = [];
-      const segs = [];     // [{x1, x2}] where snoring=true
+      const segs = [];
       let segStart = null;
       for (const r of this.snoreHist) {
         const dt = r.t - now;
@@ -146,10 +126,8 @@ const App = {
       if (segStart !== null) {
         segs.push({ x1: segStart, x2: pts[pts.length - 1][0] });
       }
-      const polyline = pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`)
-                          .join(' ');
-      const thr = (this.snap?.snore_backend === 'yamnet')
-        ? (this.yamnetThresh ?? 0.3) : 0.5;
+      const polyline = pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+      const thr = this.yamnetThresh ?? 0.3;
       const thrY = H - thr * H;
       return { W, H, polyline, segs, thrY, thr, count: pts.length };
     },
@@ -249,7 +227,14 @@ const App = {
           const held = fmt(c.armed_duration, 1);
           const total = fmt(c.trigger_hold_s || c.config?.trigger_hold_s, 1);
           const tag = c.retry_mode ? ' · 重试模式 (快节奏)' : '';
-          return `条件满足中 · 持续 ${held} / ${total} s 将触发播放${tag}`;
+          const need = c.confirm_snore_bouts ?? 0;
+          const got = c.snore_bouts_since_armed ?? 0;
+          // Retry mode skips the confirmation check (we already know they
+          // are snoring + supine), so don't show the counter then.
+          const conf = (c.config?.require_snoring && need > 0 && !c.retry_mode)
+            ? ` · 鼾声确认 ${got}/${need}`
+            : '';
+          return `条件满足中 · ${held} / ${total} s${conf}${tag}`;
         }
         default:
           return c.all_ready
@@ -258,9 +243,6 @@ const App = {
       }
     },
     isConnectedChest() { return this.snap?.chestband?.state === 'connected'; },
-    isConnectedOxi()   { return this.snap?.oximeter?.state === 'connected'; },
-    // Map mic RMS dBFS to a 0-100% bar: -80 dB → 0%, -20 dB → 100%.
-    // Gives a visible "alive" signal whenever YAMNet/mic is pulling real audio.
     micLevelPct() {
       const db = this.snap?.snore?.energy_db ?? -80;
       const pct = ((db + 80) / 60) * 100;
@@ -272,7 +254,6 @@ const App = {
       this.strategies = await api('/api/strategies');
       this.resetParamsFromStrategy();
       await this.reloadPresets();
-      await this.reloadHistory();
       await this.reloadAudioDevices();
     } catch (e) { console.error(e); }
     this.connectWS();
@@ -290,9 +271,6 @@ const App = {
     strat() { this.resetParamsFromStrategy(); this.refreshPreview(); },
     dir() { this.refreshPreview(); },
     tab(v) {
-      // Auto-refresh audio device list when user opens the devices tab,
-      // and keep it fresh while they stay there (AirPods vanish on power
-      // save, need a quick re-enumerate when they come back).
       if (this._audioPoll) { clearInterval(this._audioPoll); this._audioPoll = null; }
       if (v === 'devices') {
         this.reloadAudioDevices();
@@ -385,7 +363,6 @@ const App = {
       if (!p) return;
       this.strat = p.strategy;
       this.$nextTick(() => {
-        // apply params after strat watcher resets defaults
         const next = {};
         for (const ps of (this.currentStrategy?.params || [])) {
           next[ps.key] = (p.params && p.params[ps.key] !== undefined)
@@ -425,24 +402,6 @@ const App = {
     async chestDisconnectGo() {
       await api('/api/ble/chest/disconnect', { method: 'POST' });
     },
-    async oxiScanGo() {
-      this.oxiScan.busy = true;
-      try {
-        const r = await api('/api/ble/oxi/scan', { method: 'POST', body: {
-          named_only: this.oxiScan.namedOnly,
-          oximeter_only: this.oxiScan.oximeterOnly,
-        }});
-        if (r.ok) this.oxiScan.devices = r.devices;
-      } finally { this.oxiScan.busy = false; }
-    },
-    async oxiConnectGo() {
-      if (!this.oxiScan.addr) { alert('请选设备'); return; }
-      await api('/api/ble/oxi/connect', { method: 'POST', body: {
-        address: this.oxiScan.addr }});
-    },
-    async oxiDisconnectGo() {
-      await api('/api/ble/oxi/disconnect', { method: 'POST' });
-    },
     async testTone(d) {
       const r = await api('/api/play', { method: 'POST', body: {
         strategy: 'P1', direction: d, params: {}, repeats: 1 }});
@@ -478,39 +437,25 @@ const App = {
       }});
       if (!r.ok) alert('切换输出设备失败: ' + (r.err || ''));
     },
-    async toggleSingleEarbud(on) {
-      const r = await api('/api/audio/single-earbud', { method: 'POST', body: {
-        enabled: on,
-      }});
-      if (!r.ok) alert('切换失败: ' + (r.err || ''));
-    },
-    async setSingleEarbudTiming(patch) {
-      const r = await api('/api/audio/single-earbud', { method: 'POST', body: {
-        enabled: this.snap?.audio?.single_earbud_mode ?? true,
-        ...patch,
-      }});
-      if (!r.ok) alert('调整失败: ' + (r.err || ''));
-    },
 
     // ── experiment ─────────────────────────────────────────
     async sessionStart() {
+      const subject = (this.sessionForm.subject || '').trim();
+      if (!subject) {
+        alert('请先填写被试 ID/姓名');
+        return;
+      }
       const r = await api('/api/session/start', { method: 'POST', body: {
         tag: this.sessionForm.tag || '',
-        subject: this.sessionForm.subject || '',
+        subject,
         note: this.sessionForm.note || '',
-        mode: this.sessionForm.mode || 'A',
       }});
       if (!r.ok) alert('开始失败: ' + (r.err || ''));
     },
     async sessionStop() {
       await api('/api/session/stop', { method: 'POST' });
-      await this.reloadHistory();
     },
     async manualTrigger() { await api('/api/trigger', { method: 'POST' }); },
-    async reloadHistory() {
-      try { this.history = await api('/api/history?limit=10'); }
-      catch (e) { console.error(e); }
-    },
     async openSessionsDir() {
       await api('/api/history/open', { method: 'POST' });
     },
@@ -520,30 +465,12 @@ const App = {
     async applySnoreCfg(patch) {
       await api('/api/snore/config', { method: 'POST', body: patch });
     },
-    async switchBackend(backend) {
-      if (this.backendBusy) return;
-      this.backendBusy = true;
-      try {
-        const r = await api('/api/snore/backend', { method: 'POST', body:
-          { backend }});
-        if (!r.ok) alert('切换失败: ' + (r.err || ''));
-      } finally { this.backendBusy = false; }
-    },
-
-    // ── debug ─────────────────────────────────────────────
-    async oxiSend() {
-      if (!this.oxiHex.trim()) return;
-      const r = await api('/api/ble/oxi/manual', { method: 'POST', body: {
-        hex_str: this.oxiHex,
-        target_uuid: this.oxiTarget || null,
-      }});
-      if (!r.ok) alert('发送失败: ' + (r.err || ''));
-    },
-    async oxiRetryWake() {
-      await api('/api/ble/oxi/retry', { method: 'POST' });
-    },
 
     // ── replay ──────────────────────────────────────────
+    async reloadHistoryList() {
+      try { this.historyList = await api('/api/history?limit=20'); }
+      catch (e) { console.error(e); }
+    },
     async openReplay(sessionId) {
       this.replaySelectedId = sessionId;
       this.replayActive = null;
@@ -576,8 +503,6 @@ const App = {
       } finally { this.replayLoading = false; }
     },
     replayTraceView(series, opts) {
-      // Project [[t, y], ...] into an SVG polyline using the box dims from
-      // opts: {w, h, ymin, ymax, tmin=-60, tmax=+30}.
       const W = opts.w, H = opts.h;
       const tmin = opts.tmin ?? -60, tmax = opts.tmax ?? 30;
       const ymin = opts.ymin, ymax = opts.ymax;
@@ -657,23 +582,12 @@ const App = {
         },
       });
     },
-    // ── snore timeline (pure SVG — no Chart.js baggage) ────
     pushSnoreSample(snap) {
       if (!snap || !snap.snore) return;
       const t = snap.t || (Date.now() / 1000);
-      const backend = snap.snore_backend || snap.snore.backend || 'heuristic';
-      // For yamnet: 0..1 snoring probability. For heuristic: compress
-      // energy_db into [0,1] purely as a visual aid (not a real score).
-      let p;
-      if (backend === 'yamnet') {
-        p = snap.snore.snoring_prob ?? 0;
-      } else {
-        const e = snap.snore.energy_db ?? -80;
-        p = Math.max(0, Math.min(1, (e + 80) / 60));
-      }
-      const row = { t, p: +p, snoring: !!snap.snore.snoring, backend };
+      const p = snap.snore.snoring_prob ?? 0;
+      const row = { t, p: +p, snoring: !!snap.snore.snoring };
       this.snoreHist.push(row);
-      // keep ~90 seconds at 4 Hz = 360 points
       if (this.snoreHist.length > 360) this.snoreHist.shift();
     },
 
@@ -682,7 +596,6 @@ const App = {
       const cb = this.snap.chestband;
       const pts = (cb.chest_t || []).map((t, i) => ({ x: t, y: cb.chest_y[i] }));
       this.chestChart.data.datasets[0].data = pts;
-      // Always show last 30s window even when empty, so axes stay visible.
       const xmax = Math.max(30, pts.length ? pts[pts.length - 1].x : 30);
       this.chestChart.options.scales.x.min = Math.max(0, xmax - 30);
       this.chestChart.options.scales.x.max = xmax;
@@ -728,30 +641,31 @@ const App = {
                   @click="tab='design'">声音设计</button>
           <button class="tab-btn" :class="{active: tab==='replay'}"
                   @click="tab='replay'">回放 / 审核</button>
-          <button class="tab-btn" :class="{active: tab==='debug'}"
-                  @click="tab='debug'">调试</button>
         </nav>
         <div class="flex-1"></div>
-        <div class="flex items-center gap-3 flex-wrap">
-          <div class="text-sm dim"
-               v-if="snap && !snap.session.active">会话: 未开始</div>
-          <div class="text-sm" v-else-if="snap">
-            <span class="dim">会话:</span>
-            <span class="font-mono ml-1">{{ snap.session.id }}</span>
-            <span class="ml-2 text-emerald-300">·
-              已进行 {{ secToClock(snap.session.duration_s) }}</span>
-          </div>
-          <button class="btn success"
-                  :disabled="snap && snap.session.active"
-                  @click="sessionStart">开始会话</button>
-          <button class="btn danger"
-                  :disabled="!snap || !snap.session.active"
-                  @click="sessionStop">结束会话</button>
+        <div class="flex items-center gap-2 flex-wrap">
+          <!-- Inactive: a single subject-id input + 开始会话 + 手动触发. -->
+          <template v-if="!snap || !snap.session.active">
+            <input type="text" v-model="sessionForm.subject"
+                   placeholder="被试 ID / 姓名" class="w-[200px]">
+            <button class="btn success" @click="sessionStart">开始会话</button>
+          </template>
+          <!-- Active: show session id + duration, 结束 + 手动触发. -->
+          <template v-else>
+            <div class="text-sm">
+              <span class="dim">会话</span>
+              <span class="font-mono ml-1">{{ snap.session.id }}</span>
+              <span class="text-emerald-300 ml-2">·
+                {{ secToClock(snap.session.duration_s) }}</span>
+              <span v-if="snap.session.subject" class="dim ml-2">·
+                {{ snap.session.subject }}</span>
+            </div>
+            <button class="btn danger" @click="sessionStop">结束会话</button>
+          </template>
           <button class="btn warn" @click="manualTrigger">手动触发</button>
         </div>
       </div>
 
-      <!-- Prominent trigger-condition banner, visible on every tab. -->
       <div v-if="snap" class="mt-3 rounded-xl border px-4 py-3 transition"
            :class="triggerBannerClass">
         <div class="flex items-center gap-3 flex-wrap">
@@ -787,8 +701,6 @@ const App = {
 
     <!-- ====== tab: 实时实验 ====== -->
     <section v-show="tab==='experiment'" class="space-y-6">
-      <!-- Vital signs strip: 4 big tiles on top so you can see
-           SpO2 / 脉率 / 呼吸率 / 姿态 at a glance without digging. -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div class="card p-4 text-center"
              :class="{ 'opacity-40': snap?.chestband?.spo2_stale }">
@@ -839,8 +751,7 @@ const App = {
         </div>
       </div>
 
-      <div class="grid gap-6 md:grid-cols-2">
-        <div class="card p-5">
+      <div class="card p-5">
           <h3 class="text-sky-300 mb-1">当前触发条件 · 仰卧 + 检测到打鼾</h3>
           <p class="text-xs dim">同时满足约
             <span class="kbd">{{ fmt(snap?.controller?.config?.trigger_hold_s, 0) }} s</span>
@@ -886,73 +797,22 @@ const App = {
             </div>
             <div v-if="snap && !snap.session.active"
                  class="text-amber-300 text-sm">
-              未开始会话 · 自动闭环不会触发 (顶部「开始会话」)
+              未开始会话 · 自动闭环不会触发 (上方「开始会话」)
             </div>
             <div v-else-if="snap" class="text-emerald-300 text-sm">
               会话进行中 · 控制器状态
               <span class="kbd">{{ snap.controller.state }}</span>
+              <span v-if="snap.controller.last_strategy" class="dim ml-2">
+                · 上次 {{ snap.controller.last_strategy }} / {{ snap.controller.last_direction }}
+              </span>
             </div>
           </div>
         </div>
-
-        <div class="card p-5">
-          <div class="flex items-center justify-between">
-            <h3 class="text-sky-300">会话信息</h3>
-            <div class="text-xs dim">开始时填写，结束写入 meta.json</div>
-          </div>
-          <div class="mt-3 space-y-3">
-            <div>
-              <div class="text-xs dim mb-1">实验模式 (一晚只跑一种)</div>
-              <div class="flex gap-2 flex-wrap">
-                <button class="btn"
-                        :class="{primary: sessionForm.mode==='A'}"
-                        :disabled="snap?.session.active"
-                        @click="sessionForm.mode='A'">
-                  Block A · 体位干预 (已就绪)
-                </button>
-                <button class="btn"
-                        :class="{primary: sessionForm.mode==='B'}"
-                        :disabled="true"
-                        title="Block B 尚未实现">
-                  Block B · 截断打鼾 (即将上线)
-                </button>
-              </div>
-            </div>
-            <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
-              <label class="space-y-1">
-                <div class="text-xs dim">会话标签</div>
-                <input type="text" v-model="sessionForm.tag" placeholder="例如 pilot1"
-                       :disabled="snap?.session.active" class="w-full">
-              </label>
-              <label class="space-y-1">
-                <div class="text-xs dim">被试 ID/姓名</div>
-                <input type="text" v-model="sessionForm.subject"
-                       :disabled="snap?.session.active" class="w-full">
-              </label>
-              <label class="space-y-1">
-                <div class="text-xs dim">备注</div>
-                <input type="text" v-model="sessionForm.note"
-                       :disabled="snap?.session.active" class="w-full">
-              </label>
-            </div>
-          </div>
-          <div class="mt-4 grid grid-cols-2 gap-3 text-sm" v-if="snap">
-            <div><span class="dim">胸带包数 </span>{{ snap.session.packets }}</div>
-            <div><span class="dim">干预次数 </span>{{ snap.session.interventions }}</div>
-            <div><span class="dim">当前策略/方向 </span>
-              {{ snap.controller.last_strategy || '—' }} /
-              {{ snap.controller.last_direction || '—' }}</div>
-            <div><span class="dim">会话时长 </span>
-              {{ secToClock(snap.session.duration_s) }}</div>
-          </div>
-        </div>
-      </div>
 
       <div class="card p-5">
         <div class="flex items-center justify-between flex-wrap gap-2">
           <h3 class="text-sky-300">鼾声判决时间线  (近 90 秒)</h3>
           <div class="text-xs dim font-mono flex items-center gap-3 flex-wrap" v-if="snap">
-            <span>后端 <span class="kbd">{{ snap.snore_backend }}</span></span>
             <span>Snore <span class="text-sky-300">{{
               fmt(snap.snore?.snoring_prob ?? 0, 2) }}</span></span>
             <span>Breath {{ fmt(snap.snore?.breathing_prob ?? 0, 2) }}</span>
@@ -963,7 +823,6 @@ const App = {
               {{ snap.snore?.snoring ? '● 判为打鼾' : '○ 未触发' }}</span>
           </div>
         </div>
-        <!-- Live mic energy bar: always animating if YAMNet/mic is actually alive. -->
         <div class="mt-3 flex items-center gap-2 text-xs dim font-mono" v-if="snap">
           <span class="w-12">麦克</span>
           <div class="flex-1 h-2 rounded-full bg-slate-800/80 overflow-hidden">
@@ -976,7 +835,6 @@ const App = {
           <svg v-if="snoreView" :viewBox="'0 0 ' + snoreView.W + ' ' + snoreView.H"
                preserveAspectRatio="none" class="w-full h-[220px]"
                style="background: rgba(15,23,42,0.45); border-radius: 10px;">
-            <!-- grid -->
             <g stroke="rgba(148,163,184,0.12)" stroke-width="1">
               <line v-for="i in 5" :key="'h'+i"
                     :x1="0" :x2="snoreView.W"
@@ -985,13 +843,11 @@ const App = {
                     :x1="(snoreView.W * i / 9)" :x2="(snoreView.W * i / 9)"
                     :y1="0" :y2="snoreView.H"/>
             </g>
-            <!-- green shaded detection segments -->
             <g fill="rgba(34,197,94,0.30)" stroke="none">
               <rect v-for="(s, i) in snoreView.segs" :key="'seg'+i"
                     :x="s.x1" :y="0"
                     :width="Math.max(1, s.x2 - s.x1)" :height="snoreView.H"/>
             </g>
-            <!-- threshold line -->
             <line :x1="0" :x2="snoreView.W"
                   :y1="snoreView.thrY" :y2="snoreView.thrY"
                   stroke="#f59e0b" stroke-dasharray="6 4" stroke-width="1"/>
@@ -1000,11 +856,9 @@ const App = {
                   font-family="ui-monospace, Menlo, monospace">
               阈值 {{ fmt(snoreView.thr, 2) }}
             </text>
-            <!-- probability polyline -->
             <polyline :points="snoreView.polyline"
                       fill="none" stroke="#38bdf8" stroke-width="1.8"
                       vector-effect="non-scaling-stroke"/>
-            <!-- y-axis labels -->
             <g fill="#64748b" font-size="11"
                font-family="ui-monospace, Menlo, monospace">
               <text :x="4" :y="12">1.0</text>
@@ -1022,10 +876,6 @@ const App = {
             (等待 WebSocket 数据...)
           </div>
         </div>
-        <p class="mt-2 text-xs dim">
-          蓝线 = 每 0.25 s 的 Snoring 概率 · 绿色阴影 = 被判为打鼾的时段 · 橙色虚线 = 阈值。
-          绿色阴影出现即等价于顶上 badge「检测到·满足」; 连续保持 ≥ trigger_hold_s 才会真正触发播放。
-        </p>
       </div>
 
       <div class="card p-5">
@@ -1050,7 +900,7 @@ const App = {
         <button class="text-sky-300 font-semibold flex items-center gap-2"
                 @click="showCtrlCfg=!showCtrlCfg">
           <span>{{ showCtrlCfg ? '▾' : '▸' }}</span>
-          控制器阈值  (8s 触发 · 15s 观察 · 45s 冷却)
+          控制器阈值  (8s 触发 · 10s 观察 · 180s/5s 冷却)
         </button>
         <div v-if="showCtrlCfg && snap" class="mt-4 grid md:grid-cols-2 gap-4">
           <label class="space-y-1">
@@ -1082,6 +932,25 @@ const App = {
               {{ fmt(snap.controller.config.snoring_recent_s, 0) }} s
               <span v-if="snap.controller.snoring_age_s != null">
                 · 距上次鼾声 {{ fmt(snap.controller.snoring_age_s, 1) }} s</span>
+            </div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">额外确认鼾声次数 (防误触发) ·
+              武装后必须再出现这么多次"打鼾开始"事件才会真正播放</div>
+            <input type="range" min="0" max="3" step="1"
+                   :value="snap.controller.config.confirm_snore_bouts ?? 1"
+                   @change="applyCtrlCfg({confirm_snore_bouts: parseInt($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">
+              {{ snap.controller.config.confirm_snore_bouts ?? 1 }} 次
+              <span v-if="snap.controller.state === 'armed'"
+                    class="text-amber-300">
+                · 当前已确认 {{ snap.controller.snore_bouts_since_armed ?? 0 }} 次
+              </span>
+              <span v-else class="dim">
+                · 0 = 关闭 (单次鼾声+8 s 即触发);
+                  推荐 1 (即至少需要 2 次独立鼾声)
+              </span>
             </div>
           </label>
           <label class="space-y-1">
@@ -1169,112 +1038,52 @@ const App = {
         <button class="text-sky-300 font-semibold flex items-center gap-2"
                 @click="showSnoreCfg=!showSnoreCfg">
           <span>{{ showSnoreCfg ? '▾' : '▸' }}</span>
-          鼾声检测阈值  (后端: {{ snap?.snore_backend || '—' }})
+          鼾声检测阈值  (YAMNet)
         </button>
-        <div v-if="showSnoreCfg && snap" class="mt-4 space-y-4">
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="text-xs dim">检测器后端:</span>
-            <button class="btn" :class="{primary: snap.snore_backend==='yamnet'}"
-                    @click="switchBackend('yamnet')"
-                    :disabled="backendBusy">YAMNet (AudioSet 预训练)</button>
-            <button class="btn" :class="{primary: snap.snore_backend==='heuristic'}"
-                    @click="switchBackend('heuristic')"
-                    :disabled="backendBusy">启发式 (能量+带能比)</button>
-            <span v-if="backendBusy" class="text-xs dim">切换中…</span>
+        <div v-if="showSnoreCfg && snap" class="mt-4 grid md:grid-cols-2 gap-4">
+          <label class="space-y-1">
+            <div class="text-xs dim">Snoring 概率阈值 (0–1)</div>
+            <input type="range" min="0.05" max="0.9" step="0.05"
+                   :value="yamnetThresh"
+                   @input="yamnetThresh = parseFloat($event.target.value)"
+                   @change="applySnoreCfg({snore_prob_thresh: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">阈值 {{ fmt(yamnetThresh, 2) }} ·
+              实测 Snoring {{ fmt(snap.snore.snoring_prob, 2) }}</div>
+          </label>
+          <div class="space-y-1">
+            <div class="text-xs dim">YAMNet 最高类别 (每 0.5 s 刷新)</div>
+            <div class="text-sm font-mono">{{ snap.snore.top_class || '—' }}
+              <span class="dim">(p={{ fmt(snap.snore.top_prob, 2) }})</span></div>
+            <div class="text-xs dim">
+              Breathing {{ fmt(snap.snore.breathing_prob, 2) }} ·
+              Speech {{ fmt(snap.snore.speech_prob, 2) }} ·
+              能量 {{ fmt(snap.snore.energy_db, 1) }} dB</div>
           </div>
-
-          <div v-if="snap.snore_backend==='yamnet'" class="grid md:grid-cols-2 gap-4">
-            <label class="space-y-1">
-              <div class="text-xs dim">Snoring 概率阈值 (0–1)</div>
-              <input type="range" min="0.05" max="0.9" step="0.05"
-                     :value="yamnetThresh"
-                     @input="yamnetThresh = parseFloat($event.target.value)"
-                     @change="applySnoreCfg({snore_prob_thresh: parseFloat($event.target.value)})"
-                     class="w-full">
-              <div class="text-xs dim">阈值 {{ fmt(yamnetThresh, 2) }} ·
-                实测 Snoring {{ fmt(snap.snore.snoring_prob, 2) }}</div>
-            </label>
-            <div class="space-y-1">
-              <div class="text-xs dim">YAMNet 最高类别 (每 0.5 s 刷新)</div>
-              <div class="text-sm font-mono">{{ snap.snore.top_class || '—' }}
-                <span class="dim">(p={{ fmt(snap.snore.top_prob, 2) }})</span></div>
-              <div class="text-xs dim">
-                Breathing {{ fmt(snap.snore.breathing_prob, 2) }} ·
-                Speech {{ fmt(snap.snore.speech_prob, 2) }} ·
-                能量 {{ fmt(snap.snore.energy_db, 1) }} dB</div>
-            </div>
-            <p class="md:col-span-2 text-xs dim">
-              YAMNet 基于 Google AudioSet 预训练, 521 类里 38 类是打鼾;
-              阈值 0.3 是常用起点 — 真实打鼾时 p 通常在 0.5–0.9。
-            </p>
-          </div>
-
-          <div v-else class="grid md:grid-cols-2 gap-4">
-            <label class="space-y-1">
-              <div class="text-xs dim">能量阈值 (dB)</div>
-              <input type="range" min="-70" max="-20" step="1"
-                     :value="snap.snore.energy_db"
-                     @change="applySnoreCfg({energy_db: parseFloat($event.target.value)})"
-                     class="w-full">
-              <div class="text-xs dim">当前 {{ fmt(snap.snore.energy_db, 0) }} dB</div>
-            </label>
-            <label class="space-y-1">
-              <div class="text-xs dim">低频带能比下限</div>
-              <input type="range" min="0.2" max="0.9" step="0.02"
-                     :value="snap.snore.band_ratio || 0.55"
-                     @change="applySnoreCfg({band_ratio_min: parseFloat($event.target.value)})"
-                     class="w-full">
-              <div class="text-xs dim">实测带能比 {{ fmt(snap.snore.band_ratio, 2) }}</div>
-            </label>
-            <p class="md:col-span-2 text-xs dim">
-              只是启发式, 抗噪性差; 推荐切到 YAMNet。
-            </p>
-          </div>
+          <p class="md:col-span-2 text-xs dim">
+            YAMNet 基于 Google AudioSet 预训练, 521 类里 38 类是打鼾;
+            阈值 0.3 是常用起点 — 真实打鼾时 p 通常在 0.5–0.9。
+          </p>
         </div>
       </div>
 
-      <div class="grid md:grid-cols-2 gap-6">
-        <div class="card p-5">
-          <h3 class="text-sky-300">事件时间线</h3>
-          <pre class="timeline mt-3" v-if="snap && snap.events_tail.length"
-              >{{ snap.events_tail.join('\\n') }}</pre>
-          <div v-else class="mt-3 text-sm dim">(会话开始后显示)</div>
-        </div>
-        <div class="card p-5">
-          <div class="flex items-center justify-between">
-            <h3 class="text-sky-300">会话历史  (最近 10 次)</h3>
-            <div class="flex gap-2">
-              <button class="btn" @click="reloadHistory">刷新</button>
-              <button class="btn" @click="openSessionsDir">打开 sessions/</button>
-            </div>
-          </div>
-          <div class="mt-3 space-y-2 text-sm" v-if="history.length">
-            <div v-for="h in history" :key="h.id"
-                 class="p-3 rounded-xl border border-slate-700/40 bg-slate-800/40">
-              <div class="font-mono text-slate-200">{{ h.id }}</div>
-              <div class="text-xs dim mt-1">
-                时长 {{ h.duration_s != null ? secToClock(h.duration_s) : '—' }} ·
-                干预 {{ h.interventions ?? '—' }} ·
-                胸带 {{ h.packets ?? '—' }} 包 ·
-                被试 {{ h.subject || '—' }}
-                <span v-if="h.note"> · {{ h.note }}</span>
-                <span v-if="h.ongoing" class="text-amber-300"> · 进行中?</span>
-              </div>
-            </div>
-          </div>
-          <div v-else class="text-sm dim mt-3">(暂无, 开始一次会话再回来看)</div>
-        </div>
+      <div class="card p-5">
+        <h3 class="text-sky-300">事件时间线</h3>
+        <pre class="timeline mt-3" v-if="snap && snap.events_tail.length"
+            >{{ snap.events_tail.join('\\n') }}</pre>
+        <div v-else class="mt-3 text-sm dim">(会话开始后显示)</div>
       </div>
     </section>
 
     <!-- ====== tab: 设备连接 ====== -->
     <section v-show="tab==='devices'" class="space-y-6">
-      <div class="space-y-6">
-        <div class="card p-5">
-          <div class="flex items-center justify-between flex-wrap gap-2">
-            <h3 class="text-sky-300">胸带  HSR 1A2.0
-              <span class="text-xs dim font-normal">· 负责呼吸 / 姿态 / 转发 PC-68B SpO2</span>
-            </h3>
+      <div class="card p-5">
+        <button class="w-full flex items-center justify-between"
+                @click="showChestPanel = !showChestPanel">
+          <h3 class="text-sky-300">胸带  HSR 1A2.0
+            <span class="text-xs dim font-normal">· 呼吸 / 姿态 / 转发 PC-68B SpO2</span>
+          </h3>
+          <div class="flex items-center gap-2">
             <span v-if="isConnectedChest" class="badge ok">
               <span class="dot"></span>已连接 · 包 #{{ snap.chestband.pkt }}
             </span>
@@ -1285,8 +1094,19 @@ const App = {
               <span class="dot"></span>{{ snap.chestband.err || '错误' }}
             </span>
             <span v-else class="badge"><span class="dot"></span>未连接</span>
+            <span class="dim text-sm">{{ showChestPanel ? '▾' : '▸' }}</span>
           </div>
-          <div class="mt-4 flex gap-2 items-center flex-wrap">
+        </button>
+
+        <div class="mt-3 flex gap-2 flex-wrap" v-if="!showChestPanel">
+          <button class="btn" v-if="!isConnectedChest" @click="chestScanGo">
+            扫描并展开</button>
+          <button class="btn danger" v-else @click="chestDisconnectGo">
+            断开</button>
+        </div>
+
+        <div v-if="showChestPanel" class="mt-4 space-y-3">
+          <div class="flex gap-2 items-center flex-wrap">
             <button class="btn" :disabled="chestScan.busy" @click="chestScanGo">
               {{ chestScan.busy ? '扫描中…' : '扫描' }}</button>
             <select v-model="chestScan.addr" class="flex-1 min-w-[220px]">
@@ -1297,7 +1117,7 @@ const App = {
               </option>
             </select>
           </div>
-          <div class="mt-2 flex items-center gap-3 text-sm">
+          <div class="flex items-center gap-3 text-sm">
             <label class="flex items-center gap-1">
               <input type="checkbox" v-model="chestScan.namedOnly">
               <span>只显示有名字</span></label>
@@ -1305,11 +1125,11 @@ const App = {
               <input type="checkbox" v-model="chestScan.chestbandOnly">
               <span>仅胸带 (HSR/1A2/SRG…)</span></label>
           </div>
-          <div class="mt-4 flex gap-2">
+          <div class="flex gap-2">
             <button class="btn success" @click="chestConnectGo">连接</button>
             <button class="btn danger" @click="chestDisconnectGo">断开</button>
           </div>
-          <table class="vt mt-5" v-if="snap">
+          <table class="vt mt-3" v-if="snap">
             <thead><tr>
               <th>SpO2</th><th>脉率</th><th>呼吸率</th>
               <th>姿态</th><th>体温</th><th>电池</th>
@@ -1332,29 +1152,19 @@ const App = {
                      ? snap.chestband.vitals.batt_mv + ' mV' : '—' }}</td>
             </tr></tbody>
           </table>
-          <p class="mt-3 text-xs dim">
+          <p class="text-xs dim">
             <b>SpO2 / 脉率来源</b>：手指上夹着的 <b>PC-68B 血氧仪</b>，
-            通过胸带 BLE 转发过来 (同一条连接)。只要 PC-68B 开机就会推送，
-            <u>不用</u>在本程序里单独连它。掉数据一般是手指没夹好 / PC-68B 没电。
+            通过胸带 BLE 转发过来。只要 PC-68B 开机就会推送，<u>不用</u>在本程序里单独连它。
           </p>
         </div>
-
-        <!--
-          独立 BLE 连 PC-68B 的旧路径已验证为冗余（胸带 HSRG 变体固件
-          会把配对 PC-68B 的 SpO2/PR/PPG 打进 sub-packet 2）。相关后端
-          API 仍保留（oxi_scan / oxi_connect / oxi_disconnect + 调试 tab
-          HEX 面板），但这里不再暴露独立连接卡片，避免两条蓝牙链路互抢。
-          如以后需要把 PC-68B 当外接冗余源，可以把这段 UI 重新启用。
-        -->
       </div>
 
       <div class="card p-5">
         <h3 class="text-sky-300">音频通道  ·  鼾声麦克 + 干预音输出</h3>
         <p class="mt-2 text-sm dim">
-          推荐方案: <b>Mac 内置麦克风</b>收鼾声 (保持立体声) +
-          <b>AirPods</b> 负责播放左右方向干预音。<br>
-          如果两者都走 AirPods, 蓝牙会切到 HFP 单声道,
-          方向差就没了。系统设置里输入/输出选的是另一套 — 这里选的才是本程序真正使用的。
+          推荐: <b>电脑麦克风</b>收鼾声 + <b>耳机</b>播放干预音。
+          输入和输出走两条独立设备, 不会出现 HFP/A2DP 切换问题。
+          以后接入手机麦, 把"鼾声输入"改选成手机即可 (经 USB / 连续互通)。
         </p>
         <div class="mt-4 grid md:grid-cols-2 gap-4">
           <label class="space-y-1">
@@ -1377,17 +1187,10 @@ const App = {
               <span class="kbd">{{ snap?.snore?.status || '-' }}</span>
               <span v-if="snap?.snore?.error" class="text-rose-300">
                 · {{ snap.snore.error }}</span>
-              <span v-if="snap?.snore"
-                    :class="snap.snore.stream_open ? '' : 'text-rose-300'">
-                · 流 {{ snap.snore.stream_open ? '已打开' : '未开' }}
-              </span>
               <span v-if="snap?.snore?.last_audio_age_s != null"
                     :class="snap.snore.last_audio_age_s < 2
                               ? 'text-emerald-300' : 'text-amber-300'">
                 · 上次回调 {{ fmt(snap.snore.last_audio_age_s, 1) }}s 前
-              </span>
-              <span v-else-if="snap?.snore?.stream_open" class="text-amber-300">
-                · 流开着但从未收到音频 (AirPods 可能卡在 A2DP)
               </span>
             </div>
           </label>
@@ -1406,13 +1209,6 @@ const App = {
                 ({{ d.max_output_channels }} ch{{ d.is_default ? ' · 默认' : '' }})
               </option>
             </select>
-            <div v-if="!hasAirPodsOutput" class="text-xs text-amber-300">
-              列表里没有 AirPods — 请先在 macOS 蓝牙面板连接 AirPods, 再点下方「重新枚举设备」。
-            </div>
-            <div v-else class="text-xs dim">
-              若选了 AirPods 还是电脑出声, 多半是蓝牙进了 HFP 单声道;
-              把鼾声输入切回 MacBook 内置麦即可让 AirPods 维持 A2DP 立体声。
-            </div>
           </label>
         </div>
         <div class="mt-4 flex gap-2 flex-wrap">
@@ -1422,68 +1218,6 @@ const App = {
           <button class="btn" @click="testTone('left')">测试音 (左)</button>
           <button class="btn" @click="testTone('right')">测试音 (右)</button>
           <button class="btn danger" @click="stopAudio">停止</button>
-        </div>
-
-        <div class="mt-4 pt-4 border-t border-slate-700/40">
-          <label class="flex items-start gap-3 text-sm cursor-pointer">
-            <input type="checkbox"
-                   :checked="snap?.audio?.single_earbud_mode"
-                   @change="toggleSingleEarbud($event.target.checked)"
-                   class="mt-0.5">
-            <div>
-              <div class="font-semibold text-sky-200">单耳机模式 (实验性)</div>
-              <div class="text-xs dim mt-1">
-                勾上 = 用 AirPods 同时做收音+放音。
-                每次播放前会关麦克风 + 重建 PortAudio, 让耳机从 HFP 切回 A2DP
-                (否则只能出单声道), 播完再开回麦克。
-                期间麦克风不采样, 会有 2-3 秒的录音空档;
-                macOS 在切换时可能发一声提示音, 被试能否接受要你自己试一下。
-              </div>
-              <div v-if="snap?.audio?.single_earbud_mode"
-                   class="mt-2 text-xs space-y-1">
-                <div class="text-amber-300">ⓘ 当前已启用。</div>
-                <div v-if="snap.audio.single_earbud_active"
-                     class="text-emerald-300">
-                  ✓ 实际生效 — 输入检测为蓝牙/AirPods, 播放前会切 A2DP, 有 ~{{
-                    fmt(snap.audio.single_earbud_preroll_s, 1)
-                  }} s 麦克风盲区。
-                </div>
-                <div v-else class="dim">
-                  · 当前输入 <b class="text-sky-200">{{
-                    snap.audio.input_name || '(OS 默认)' }}</b>
-                  不经过蓝牙, <u>单耳机模式在此配置下不产生实际效果</u>
-                  — 麦克和扬声器是两条独立通道, 不需要 HFP/A2DP 切换。
-                  想真正体验单耳机双工, 请把"鼾声输入"也切到 AirPods。
-                </div>
-              </div>
-              <div v-if="snap?.audio?.single_earbud_mode"
-                   class="mt-3 grid grid-cols-2 gap-3">
-                <label class="space-y-1">
-                  <div class="dim">preroll · 关麦后等多久再播
-                    <span class="dim">(AirPods Pro ≈ 2.5 s 才切完 A2DP)</span>
-                  </div>
-                  <input type="range" min="0.5" max="5" step="0.1"
-                         :value="snap.audio.single_earbud_preroll_s"
-                         @change="setSingleEarbudTiming({preroll_s: parseFloat($event.target.value)})"
-                         class="w-full">
-                  <div class="dim">{{ fmt(snap.audio.single_earbud_preroll_s, 1) }} s
-                    <span v-if="snap.audio.single_earbud_preroll_s < 2"
-                          class="text-amber-300">
-                      · 太短, 可能仍听到单声道
-                    </span>
-                  </div>
-                </label>
-                <label class="space-y-1">
-                  <div class="dim">postroll · 播完后等多久再开麦</div>
-                  <input type="range" min="0.1" max="2" step="0.1"
-                         :value="snap.audio.single_earbud_postroll_s"
-                         @change="setSingleEarbudTiming({postroll_s: parseFloat($event.target.value)})"
-                         class="w-full">
-                  <div class="dim">{{ fmt(snap.audio.single_earbud_postroll_s, 1) }} s</div>
-                </label>
-              </div>
-            </div>
-          </label>
         </div>
       </div>
     </section>
@@ -1569,12 +1303,12 @@ const App = {
         <div class="flex items-center justify-between flex-wrap gap-2">
           <h3 class="text-sky-300">历史会话</h3>
           <div class="flex gap-2">
-            <button class="btn" @click="reloadHistory">刷新列表</button>
+            <button class="btn" @click="reloadHistoryList">刷新列表</button>
             <button class="btn" @click="openSessionsDir">打开 sessions/</button>
           </div>
         </div>
-        <div class="mt-3 space-y-2 text-sm" v-if="history.length">
-          <div v-for="h in history" :key="h.id"
+        <div class="mt-3 space-y-2 text-sm" v-if="(historyList || []).length">
+          <div v-for="h in historyList" :key="h.id"
                class="p-3 rounded-xl border cursor-pointer transition"
                :class="replaySelectedId===h.id
                         ? 'border-sky-500 bg-sky-500/10'
@@ -1596,7 +1330,7 @@ const App = {
             <div v-if="h.note" class="text-xs dim mt-1">{{ h.note }}</div>
           </div>
         </div>
-        <div v-else class="text-sm dim mt-3">(暂无历史会话)</div>
+        <div v-else class="text-sm dim mt-3">(点「刷新列表」加载历史会话)</div>
       </div>
 
       <div v-if="replayDetail" class="card p-5 space-y-4">
@@ -1604,8 +1338,7 @@ const App = {
           <div>
             <h3 class="text-sky-300">会话 {{ replayDetail.id }}</h3>
             <div class="text-xs dim">
-              模式 <span class="kbd">{{ replayDetail.meta?.mode || 'A' }}</span>
-              · 被试 {{ replayDetail.meta?.subject_id || '—' }}
+              被试 {{ replayDetail.meta?.subject_id || '—' }}
               · 开始 {{ replayDetail.meta?.started_at || '—' }}
               · 干预 {{ replayDetail.events?.length || 0 }} 次
             </div>
@@ -1655,17 +1388,11 @@ const App = {
                  @click="openReplayEvent(ev)">
               <div class="flex flex-wrap items-center gap-3 text-sm">
                 <span class="font-mono">{{ ev.time_str }}</span>
-                <span class="kbd">Block {{ ev.block }}</span>
                 <span>{{ ev.strategy }} / {{ ev.direction }}</span>
                 <span :class="ev.success ? 'text-emerald-300' : 'text-rose-300'">
                   {{ ev.success ? '成功' : '未响应' }}</span>
                 <span class="dim text-xs">
                   潜伏 {{ ev.latency_s != null ? fmt(ev.latency_s, 1) + 's' : '—' }}
-                </span>
-                <span class="dim text-xs ml-auto">
-                  <span v-if="ev.files.mic">🎙️ mic</span>
-                  <span v-if="ev.files.played"> · 🔊 intervention</span>
-                  <span v-if="ev.files.npz"> · 📈 traces</span>
                 </span>
               </div>
             </div>
@@ -1673,19 +1400,15 @@ const App = {
         </div>
       </div>
 
-      <!-- Event detail -->
       <div v-if="replayActive" class="card p-5 space-y-4">
         <div class="flex items-center justify-between flex-wrap gap-2">
           <div>
             <h3 class="text-sky-300">事件详情 · {{ replayActive.event.time_str }}
               · {{ replayActive.event.strategy }} / {{ replayActive.event.direction }}</h3>
-            <div class="text-xs dim">
-              触发时刻为 0 s; 向前看 60 s, 向后看 30 s
-            </div>
+            <div class="text-xs dim">触发时刻为 0 s; 向前看 60 s, 向后看 30 s</div>
           </div>
         </div>
 
-        <!-- Snoring probability -->
         <div>
           <div class="text-xs dim mb-1">Snoring 概率 (0..1)</div>
           <svg viewBox="0 0 900 120" preserveAspectRatio="none"
@@ -1702,7 +1425,6 @@ const App = {
           </svg>
         </div>
 
-        <!-- Chest respiration -->
         <div>
           <div class="text-xs dim mb-1">胸呼吸波形</div>
           <svg viewBox="0 0 900 120" preserveAspectRatio="none"
@@ -1716,7 +1438,6 @@ const App = {
           </svg>
         </div>
 
-        <!-- SpO2 -->
         <div>
           <div class="text-xs dim mb-1">SpO2 (%) · ±60 s 窗口</div>
           <svg viewBox="0 0 900 100" preserveAspectRatio="none"
@@ -1730,7 +1451,6 @@ const App = {
           </svg>
         </div>
 
-        <!-- Audio players -->
         <div class="grid md:grid-cols-2 gap-4">
           <div v-if="replayActive.event.files.played">
             <div class="text-xs dim mb-1">实际播放的干预音</div>
@@ -1746,62 +1466,11 @@ const App = {
       </div>
     </section>
 
-    <!-- ====== tab: 调试 ====== -->
-    <section v-show="tab==='debug'" class="space-y-6">
-      <div class="card p-5">
-        <h3 class="text-sky-300">血氧仪 · 手动 HEX 命令  (高级 · 冗余路径)</h3>
-        <p class="mt-2 text-sm dim">
-          <b>仅在需要把 PC-68B 作为独立 BLE 数据源时才用。</b>
-          主实验流程里 SpO2 / PR / PPG 已经由 PC-68B 通过胸带 BLE 转发过来，
-          <u>不需要</u>在这里连它。保留这个面板是为了抓包 / 调试私有协议。
-        </p>
-        <div class="mt-3 grid md:grid-cols-4 gap-3">
-          <select v-model="oxiTarget" class="md:col-span-2">
-            <option value="">(自动)</option>
-            <option v-for="u in (snap?.oximeter?.write_uuids || [])"
-                    :key="u" :value="u">{{ u }}</option>
-          </select>
-          <input type="text" v-model="oxiHex" class="md:col-span-2"
-                 placeholder="如: 7d 81 a1 80 80 80 80 80 80 a7">
-        </div>
-        <div class="mt-3 flex gap-2">
-          <button class="btn" @click="oxiSend">发送</button>
-          <button class="btn" @click="oxiRetryWake">重试全部预置</button>
-        </div>
-        <div class="mt-5 text-xs dim">
-          收到帧 {{ snap?.oximeter?.pkt || 0 }}
-        </div>
-      </div>
-
-      <div class="card p-5">
-        <h3 class="text-sky-300">原始帧  (最近 20 条)</h3>
-        <pre class="timeline mt-3" style="max-height: 18rem;"
-            v-if="snap && snap.oximeter.raw_tail.length"
-            >{{ snap.oximeter.raw_tail.join('\\n') }}</pre>
-        <div v-else class="mt-3 text-sm dim">(连接后显示, 若持续无更新说明无 notify 数据)</div>
-      </div>
-
-      <div class="card p-5">
-        <h3 class="text-sky-300">GATT / 订阅日志  (最近 40 行)</h3>
-        <pre class="timeline mt-3" style="max-height: 22rem;"
-            v-if="snap && snap.oximeter.log_tail.length"
-            >{{ snap.oximeter.log_tail.join('\\n') }}</pre>
-        <div v-else class="mt-3 text-sm dim">(连接后显示)</div>
-      </div>
-    </section>
-
   </main>
-
-  <footer class="max-w-[1200px] mx-auto w-full px-4 py-4 text-xs dim">
-    手机访问: 和电脑在同一 Wi-Fi 下打开
-    <span class="kbd">http://&lt;Mac IP&gt;:8000</span> ·
-    事件通过 WebSocket 实时推送
-  </footer>
 
 </div>`,
 };
 
-// inject helpers into template scope
 App.methods.fmt = fmt;
 App.methods.secToClock = secToClock;
 App.methods.postureZh = postureZh;

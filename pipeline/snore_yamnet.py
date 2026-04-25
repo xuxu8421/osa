@@ -36,6 +36,8 @@ from typing import Optional, Tuple
 import numpy as np
 import sounddevice as sd
 
+# noqa: F401 — kept so callers can monkeypatch CACHE_DIR before construction.
+
 
 # YAMNet native input: 16 kHz mono, 0.96 s window (15600 samples)
 YAMNET_SR = 16000
@@ -123,21 +125,46 @@ class YamnetSnoreDetector:
 
     # ── model loading (lazy; called from worker thread) ──
 
+    # Where we keep the locally cached YAMNet weights + class map. Both
+    # are downloaded once from a stable Google Cloud Storage bucket
+    # (different from the unreliable tfhub.dev redirector).
+    _CACHE_DIR = Path(os.path.expanduser('~/.cache/osa_yamnet'))
+    _WEIGHTS_URL = 'https://storage.googleapis.com/audioset/yamnet.h5'
+    _CLASSMAP_URL = ('https://raw.githubusercontent.com/tensorflow/models/'
+                     'master/research/audioset/yamnet/yamnet_class_map.csv')
+
+    def _ensure_files(self) -> Tuple[Path, Path]:
+        """Make sure yamnet.h5 + yamnet_class_map.csv exist locally,
+        downloading them on first run. Returns (weights_path, classmap_path).
+        """
+        self._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        weights = self._CACHE_DIR / 'yamnet.h5'
+        classmap = self._CACHE_DIR / 'yamnet_class_map.csv'
+        # weights tend to be > 14 MB; tiny files = aborted download.
+        if not weights.exists() or weights.stat().st_size < 5 * 1024 * 1024:
+            urllib.request.urlretrieve(self._WEIGHTS_URL, str(weights))
+        if not classmap.exists() or classmap.stat().st_size < 1024:
+            urllib.request.urlretrieve(self._CLASSMAP_URL, str(classmap))
+        return weights, classmap
+
     def _ensure_model(self) -> bool:
         if self._model is not None:
             return True
+        os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
         try:
-            # Import here so the module can be loaded even when TF is missing
-            # (we fall back to the heuristic detector in that case).
-            import tensorflow_hub as hub          # noqa: F401
-            import tensorflow as tf               # noqa: F401
-            os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
             self.status = 'loading'
-            self._model = hub.load('https://tfhub.dev/google/yamnet/1')
-            # Read class map the model ships with.
-            class_map_path = self._model.class_map_path().numpy().decode()
+            weights, classmap = self._ensure_files()
+
+            # Build the YAMNet Keras model from the vendored definition and
+            # load_weights from the .h5 file we just cached. This avoids the
+            # flaky tfhub.dev / tfhub-modules bucket entirely.
+            from ._yamnet import params as yparams
+            from ._yamnet import yamnet as yamnet_lib
+            self._model = yamnet_lib.yamnet_frames_model(yparams.Params())
+            self._model.load_weights(str(weights))
+
             import csv
-            with open(class_map_path, 'r') as f:
+            with open(classmap, 'r') as f:
                 reader = csv.reader(f)
                 next(reader)  # header
                 self._class_names = [row[2] for row in reader if len(row) >= 3]

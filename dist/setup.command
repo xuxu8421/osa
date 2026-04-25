@@ -48,12 +48,16 @@ pip install -r "$ROOT/requirements.txt"
 printf "▶ 校准 numpy 版本 (TF 需要 <2) …\n"
 pip install 'numpy>=1.26,<2' --force-reinstall --no-deps >/dev/null
 
-printf "\n▶ 预热 YAMNet 模型 (首次 ~15 秒, 下载 17 MB) …\n"
+printf "\n▶ 预热 YAMNet 模型 (首次 ~15 秒, 下载 ~15 MB 权重 + 14 KB 类表) …\n"
 python -c "
 import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
-import tensorflow_hub as hub
-m = hub.load('https://tfhub.dev/google/yamnet/1')
-print('  YAMNet OK, classes:', m.class_map_path().numpy().decode())
+from pipeline.snore_yamnet import YamnetSnoreDetector
+d = YamnetSnoreDetector(bus=None)
+ok = d._ensure_model()
+if ok:
+    print('  YAMNet OK ·', len(d._class_names), '类 · 缓存在 ~/.cache/osa_yamnet/')
+else:
+    print('  × YAMNet 预热失败:', d.error)
 " || printf "  (YAMNet 预热失败, 程序首次启动时会重试)\n"
 
 printf "\n▶ 枚举音频设备 …\n"
@@ -70,7 +74,7 @@ printf "\n\033[1;32m✅ 安装完成!\033[0m\n"
 printf "\n下一步:\n"
 printf "  1. 双击 \033[1mstart_night.command\033[0m 打开控制台\n"
 printf "  2. 浏览器会自动打开 http://localhost:8000\n"
-printf "  3. 对着蓝牙菜单选择 AirPods 作为输出\n"
-printf "  4. 在网页里「设备连接」tab 扫描并连接胸带 + 血氧仪\n"
+printf "  3. 把耳机用蓝牙连上 Mac (输出端)\n"
+printf "  4. 在网页「设备连接」tab 扫描并连接胸带\n"
 printf "\n"
 read -p "按回车键关闭此窗口 (环境会保留) …"

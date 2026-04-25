@@ -11,15 +11,16 @@
  │ PC-68B 血氧仪   │─ SpO2/PR ─▶│  HSR 1A2.0 胸带 (BLE)     │──chestband.data──┐
  │  (夹手指开机)    │  转发       │    └ 姿态/呼吸/SpO2/ECG   │                  │
  └────────────────┘             └──────────────────────────┘                  │
+                                                                              │
  ┌──────────────────────────┐                                                 │
- │  PC-68B 独立 BLE (冗余)    │──oximeter.reading                              │
- │  (默认关闭, 调试/抓包用)   │       (默认不启动)                              │
- └──────────────────────────┘                                                 │         ┌───────────────┐
+ │  麦克风 (sounddevice)     │──snore.state─────┐                             │
+ │    └ YAMNet 推理           │                  │                             │
+ └──────────────────────────┘                  │                             │
+                                               │         ┌───────────────┐
                                                ├────────▶│  EventBus     │
- ┌──────────────────────────┐                  │         │ (发布/订阅)    │
- │  Mac 麦克风 (sounddevice) │──snore.state─────┤         └───────┬───────┘
- │    └ YAMNet 或启发式       │                  │                 │
- └──────────────────────────┘                  │                 │
+                                               │         │ (发布/订阅)    │
+                                               │         └───────┬───────┘
+                                               │                 │
                                                │                 ├─▶ PostureAnalyzer
                                                │                 │     └ posture.sample/change
                                                │                 │
@@ -32,13 +33,13 @@
                                                │                 └─▶ SessionRecorder
                                                │                       └ 所有事件 → jsonl/csv/npz
                                                │
-                                               │         ┌───────────────┐
-                                               └────────▶│ OsaRuntime    │ (单例)
-                                                         │   + snapshot()│─── WebSocket /ws ──▶ 前端
-                                                         └───────────────┘
-                                                         ┌───────────────┐
+                                               │         ┌───────────────────┐
+                                               └────────▶│ OsaRuntime (单例)  │
+                                                         │   + snapshot()    │─── WebSocket /ws ──▶ 前端
+                                                         └───────────────────┘
+                                                         ┌───────────────────┐
                                                          │ FastAPI (uvicorn) │
-                                                         │   REST + /ws       │
+                                                         │   REST + /ws      │
                                                          └───────────────────┘
 ```
 
@@ -48,10 +49,9 @@
 |----|------|------|
 | `EventBus` | `pipeline/events.py` | 线程安全的发布-订阅，所有跨模块沟通都走这里 |
 | `PostureAnalyzer` | `pipeline/posture.py` | 从胸带 IMU 出姿态分类 + debounce |
-| `MicSnoreDetector` | `pipeline/snore.py` | 启发式（能量 + 80–500 Hz 带能比）；YAMNet 装不上时的后备 |
-| `YamnetSnoreDetector` | `pipeline/snore_yamnet.py` | 主力；TF Hub `yamnet/1`，每 0.25 s 推理一次 |
+| `YamnetSnoreDetector` | `pipeline/snore_yamnet.py` | TF Hub `yamnet/1`，每 0.25 s 推理一次 |
 | `ClosedLoopController` | `pipeline/controller.py` | Block A 状态机；触发 / 播放 / 观察 / 冷却 |
-| `LocalAudioSink` | `pipeline/audio.py` | sounddevice 播放 + 单耳机模式 hook |
+| `LocalAudioSink` | `pipeline/audio.py` | sounddevice 播放 |
 | `SessionRecorder` | `pipeline/recorder.py` | 订阅所有事件 → `sessions/<id>/` 落盘 |
 | `OsaRuntime` | `server/runtime.py` | 上面这一锅的 facade，一个进程一个实例 |
 | FastAPI app | `server/app.py` | REST + WebSocket，纯 IO 层 |
@@ -62,7 +62,7 @@
 | 线程 | 起源 | 做什么 |
 |------|-----|--------|
 | uvicorn main | 进程启动 | 跑 FastAPI、HTTP 路由、WebSocket handler |
-| BLE asyncio loop | `OsaRuntime._start_ble_loop` | 独占一条 event loop，胸带/血氧的 Bleak 都在这跑 |
+| BLE asyncio loop | `OsaRuntime._start_ble_loop` | 独占一条 event loop，胸带 Bleak 在这跑 |
 | sounddevice audio callback | PortAudio | 麦克风 16 kHz 回调；只往 ring buffer 写 |
 | YAMNet worker | `YamnetSnoreDetector._worker_loop` | 每 0.25 s 拉最近 0.96 s 做推理 |
 | SessionRecorder flusher | `SessionRecorder._flush_loop` | 每 2 s 把波形 buffer 写一个压缩 `.npz` 块 |
@@ -76,11 +76,10 @@
 
 | 事件 | 发者 | 常见订阅者 |
 |------|------|-----------|
-| `chestband.data` | `devices/chestband.py` | Recorder, PostureAnalyzer, Runtime(vitals, SpO2 来源主路径) |
-| `oximeter.reading` | `devices/oximeter.py` | Recorder, Runtime（默认不启动；仅独立连 PC-68B 抓包时才有） |
+| `chestband.data` | `devices/chestband.py` | Recorder, PostureAnalyzer, Runtime(vitals + SpO2) |
 | `posture.sample` | PostureAnalyzer | Controller, Runtime |
 | `posture.change` | PostureAnalyzer | Controller, Recorder |
-| `snore.state` | `MicSnoreDetector` / `YamnetSnoreDetector` | Runtime(history), Recorder |
+| `snore.state` | `YamnetSnoreDetector` | Runtime(history), Recorder |
 | `intervention.state` | Controller | Recorder, Runtime |
 | `intervention.triggered` | Controller | Recorder, Runtime (→ snapshot) |
 | `intervention.response` | Controller | Recorder, Runtime |
@@ -102,3 +101,11 @@
 类似地，`pipeline/sensors.py` 的 `Sensor` 协议是为了把"来自不同厂家的传感器"
 统一成同样的事件接口；未来换成自家耳机平台上报的数据，只需实现一个新的
 `HeadsetSensor` 即可。
+
+## 当前默认硬件配置
+
+- **输入**：Mac 内置麦克风（YAMNet 推理）。未来改用手机麦克风时，只需在 Web UI
+  「设备连接」tab 把"鼾声输入"换成连进来的手机即可，代码无需改动。
+- **输出**：Mac 默认输出（连接耳机后即用耳机）。
+- **生理**：HSR 1A2.0 胸带（BLE 直连）+ PC-68B 血氧仪（夹手指开机，不另起 BLE，
+  数据由胸带 BLE 转发）。

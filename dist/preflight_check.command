@@ -38,9 +38,9 @@ except Exception as e:
 printf "\n▶ YAMNet 模型 (在线打鼾检测):\n"
 python -c "
 import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
-import tensorflow_hub as hub
-m = hub.load('https://tfhub.dev/google/yamnet/1')
-print('   OK (模型已缓存)')
+from pipeline.snore_yamnet import YamnetSnoreDetector
+d = YamnetSnoreDetector(bus=None)
+print('   OK (已缓存)' if d._ensure_model() else f'   × {d.error}')
 " || printf "   × YAMNet 加载失败 — 检查网络或重新运行 setup\n"
 
 printf "\n▶ 测试音 (3 声, MacBook 扬声器):\n"
@@ -54,7 +54,10 @@ for i in range(3):
 print('   OK')
 "
 
-printf "\n▶ 蓝牙: 请手动在左上角 蓝牙 菜单里确认 AirPods 已连接\n"
+printf "\n▶ 蓝牙: 请确认\n"
+printf "   · 耳机已连接 (左上角蓝牙菜单)\n"
+printf "   · 胸带 (HSR/1A2/SRG) 开机 + 戴在身上\n"
+printf "   · PC-68B 血氧仪开机 + 夹手指 (它会经胸带 BLE 转发数据进来)\n"
 
 printf "\n\033[1;32m自检完毕\033[0m\n"
 read -p "按回车键关闭 …"

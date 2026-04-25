@@ -75,6 +75,13 @@ class ControllerConfig:
     # `snoring_recent_s` seconds. The detector's own hangover stays short
     # so the UI timeline stays truthful.
     snoring_recent_s: float = 15.0
+    # False-positive guard: require this many *new* snore bouts (False→True
+    # transitions of snore.state) to occur AFTER arming, before we fire.
+    # 0 = no extra confirmation (legacy behaviour, fires on first armed
+    # window). 1 = at least one additional snore must arrive during the
+    # hold window — protects against single-event false positives like a
+    # cough or door slam that YAMNet briefly flags as "Snoring".
+    confirm_snore_bouts: int = 1
     # Strategy pool — randomly chosen on trigger
     strategy_pool: tuple = ('P1', 'P2', 'P3')
     # Preferred playback direction; 'opposite' = play to opposite-of-current
@@ -136,11 +143,17 @@ class ClosedLoopController:
         # Timestamp of the last positive snoring reading (from the detector).
         # Used by `_snoring_ok` to tolerate the gaps between snore events.
         self._last_snore_at: float = 0.0
+        # False→True transition counter for snore.state events received while
+        # the controller is in `armed` state. Reset in _arm. Used as
+        # confirmation (see ControllerConfig.confirm_snore_bouts).
+        self._snore_bouts_since_armed: int = 0
+        self._was_snoring_last_event: bool = False
         self._lock = threading.Lock()
 
         self._unsubs = [
             bus.subscribe('posture.change', self._on_posture_change),
             bus.subscribe('posture.sample', self._on_posture_sample),
+            bus.subscribe('snore.state', self._on_snore_state),
         ]
 
     def close(self):
@@ -186,6 +199,8 @@ class ClosedLoopController:
             'effective_trigger_hold_s': float(effective_hold),
             'first_trigger_hold_s': float(self.cfg.trigger_hold_s),
             'retry_trigger_hold_s': float(self.cfg.retry_trigger_hold_s),
+            'confirm_snore_bouts': int(self.cfg.confirm_snore_bouts),
+            'snore_bouts_since_armed': int(self._snore_bouts_since_armed),
         }
 
     # ── trigger-condition gating ──
@@ -236,6 +251,16 @@ class ClosedLoopController:
         return gap <= float(self.cfg.snoring_recent_s)
 
     # ── event handlers ──
+
+    def _on_snore_state(self, ev: Event):
+        """Track False→True transitions of the snoring flag so we can
+        require a *new* snore bout AFTER arming before firing."""
+        p = ev.payload or {}
+        snoring = bool(p.get('snoring', False))
+        rising_edge = snoring and not self._was_snoring_last_event
+        self._was_snoring_last_event = snoring
+        if rising_edge and self.state == 'armed':
+            self._snore_bouts_since_armed += 1
 
     def _on_posture_change(self, ev: Event):
         pc = ev.payload
@@ -314,6 +339,21 @@ class ClosedLoopController:
                        if self._retry_mode
                        else self.cfg.trigger_hold_s)
         if held >= hold_target:
+            # False-positive guard: require N additional snore bouts to have
+            # arrived AFTER arming. ONLY applies to the *first* fire of an
+            # episode — in retry mode we have already established the
+            # subject is snoring + supine, so we keep nudging at the short
+            # cadence regardless. Otherwise continuous snoring (which keeps
+            # is_snoring=True with no False→True edges) would never produce
+            # confirmation bouts and we'd freeze in armed forever.
+            need = int(self.cfg.confirm_snore_bouts)
+            if (self.cfg.require_snoring and need > 0
+                    and not self._retry_mode
+                    and self._snore_bouts_since_armed < need):
+                # Hold elapsed but not enough new snores → drop back to idle.
+                # If real snoring resumes, posture+snoring will re-arm.
+                self._to_idle('insufficient_snore_bouts')
+                return
             self._fire(reason='auto_hold')
 
     # ── state transitions ──
@@ -333,6 +373,9 @@ class ClosedLoopController:
             self.state = 'armed'
             self._armed_since = now
             self._last_posture_at_trigger = posture
+            # Reset confirmation counter; the bout that caused arming is
+            # NOT counted here (we want a *new* one after this point).
+            self._snore_bouts_since_armed = 0
         self.bus.emit('intervention.state',
                       {'state': 'armed', 'posture': posture,
                        'trigger_hold_s': hold_target,

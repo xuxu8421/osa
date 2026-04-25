@@ -1,0 +1,83 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "type": "frame",
+      "x": 0, "y": 0,
+      "width": 1200, "height": 380,
+      "layout": "none",
+      "fillColor": "#F7FAFC",
+      "borderColor": "#F7FAFC",
+      "children": [
+        {
+          "type": "text",
+          "x": 300, "y": 18,
+          "width": 600, "height": "fit-content",
+          "text": [{ "content": "OSA 声音干预实验 · 预期路线图", "bold": true, "fontSize": 22 }],
+          "textColor": "#1F2937",
+          "textAlign": "center"
+        },
+
+        { "type": "svg", "x": 40, "y": 80, "width": 260, "height": 40,
+          "svg": { "code": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 260 40\"><polygon points=\"0,0 240,0 260,20 240,40 0,40\" fill=\"#34D399\"/></svg>" } },
+        { "type": "text", "x": 40, "y": 88, "width": 240, "height": "fit-content",
+          "text": [{ "content": "Phase 0 · 工程底座 ✅", "bold": true, "fontSize": 14 }],
+          "textColor": "#FFFFFF", "textAlign": "center" },
+        { "type": "rect", "x": 40, "y": 150, "width": 260, "height": 180,
+          "fillColor": "#ECFDF5", "borderColor": "#34D399", "borderWidth": 2,
+          "borderRadius": 10 },
+        { "type": "text", "x": 52, "y": 166, "width": 236, "height": "fit-content",
+          "text": [{ "content": "已完成", "bold": true, "fontSize": 15 }],
+          "textColor": "#065F46", "textAlign": "center" },
+        { "type": "text", "x": 52, "y": 194, "width": 236, "height": "fit-content",
+          "text": "声音合成 · BLE 采集 · 数据管线 · 闭环状态机 · Web 控制台 · 部署包",
+          "fontSize": 13, "textColor": "#065F46", "textAlign": "center" },
+
+        { "type": "svg", "x": 320, "y": 80, "width": 260, "height": 40,
+          "svg": { "code": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 260 40\"><polygon points=\"0,0 240,0 260,20 240,40 0,40\" fill=\"#34D399\"/></svg>" } },
+        { "type": "text", "x": 320, "y": 88, "width": 240, "height": "fit-content",
+          "text": [{ "content": "Phase 1 · 本机自验 ✅", "bold": true, "fontSize": 14 }],
+          "textColor": "#FFFFFF", "textAlign": "center" },
+        { "type": "rect", "x": 320, "y": 150, "width": 260, "height": 180,
+          "fillColor": "#ECFDF5", "borderColor": "#34D399", "borderWidth": 2,
+          "borderRadius": 10 },
+        { "type": "text", "x": 332, "y": 166, "width": 236, "height": "fit-content",
+          "text": [{ "content": "已完成", "bold": true, "fontSize": 15 }],
+          "textColor": "#065F46", "textAlign": "center" },
+        { "type": "text", "x": 332, "y": 194, "width": 236, "height": "fit-content",
+          "text": "自己戴胸带 + AirPods，床上跑 10 分钟闭环；session 结构稳定、快照完整",
+          "fontSize": 13, "textColor": "#065F46", "textAlign": "center" },
+
+        { "type": "svg", "x": 600, "y": 80, "width": 260, "height": 40,
+          "svg": { "code": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 260 40\"><polygon points=\"0,0 240,0 260,20 240,40 0,40\" fill=\"#F59E0B\"/></svg>" } },
+        { "type": "text", "x": 600, "y": 88, "width": 240, "height": "fit-content",
+          "text": [{ "content": "Phase 2 · 策略筛选 🟢 下一步", "bold": true, "fontSize": 14 }],
+          "textColor": "#FFFFFF", "textAlign": "center" },
+        { "type": "rect", "x": 600, "y": 150, "width": 260, "height": 180,
+          "fillColor": "#FFFBEB", "borderColor": "#F59E0B", "borderWidth": 2,
+          "borderRadius": 10 },
+        { "type": "text", "x": 612, "y": 166, "width": 236, "height": "fit-content",
+          "text": [{ "content": "4 周内", "bold": true, "fontSize": 15 }],
+          "textColor": "#92400E", "textAlign": "center" },
+        { "type": "text", "x": 612, "y": 194, "width": 236, "height": "fit-content",
+          "text": "1-2 位打鼾志愿者 × 2-3 晚；随机策略暴露；对比 P1/P2/P3 响应率与主观评分",
+          "fontSize": 13, "textColor": "#92400E", "textAlign": "center" },
+
+        { "type": "svg", "x": 880, "y": 80, "width": 260, "height": 40,
+          "svg": { "code": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 260 40\"><polygon points=\"0,0 240,0 260,20 240,40 0,40\" fill=\"#9CA3AF\"/></svg>" } },
+        { "type": "text", "x": 880, "y": 88, "width": 240, "height": "fit-content",
+          "text": [{ "content": "Phase 3 · OSA 事件干预 ⏸", "bold": true, "fontSize": 14 }],
+          "textColor": "#FFFFFF", "textAlign": "center" },
+        { "type": "rect", "x": 880, "y": 150, "width": 260, "height": 180,
+          "fillColor": "#F3F4F6", "borderColor": "#9CA3AF", "borderWidth": 2,
+          "borderRadius": 10, "borderDash": "dashed" },
+        { "type": "text", "x": 892, "y": 166, "width": 236, "height": "fit-content",
+          "text": [{ "content": "待 Phase 2 数据 + 临床合作", "bold": true, "fontSize": 15 }],
+          "textColor": "#374151", "textAlign": "center" },
+        { "type": "text", "x": 892, "y": 194, "width": 236, "height": "fit-content",
+          "text": "Apnea/Hypopnea 实时检测；触发从鼾声升级为真 OSA 事件；临床基线夜 vs 干预夜对照",
+          "fontSize": 13, "textColor": "#374151", "textAlign": "center" }
+      ]
+    }
+  ]
+}

@@ -1,7 +1,32 @@
-# 远期路线图
+# OSA 声音干预实验 · 进展与路线图
 
-当前代码完整实现了 **Block A · 体位干预**（仰卧 + 打鼾触发 → 定向声音诱导翻身）。
-本文件描述后续三个增量方向，按优先级排序。
+> 最近更新：2026-04-21 · 当前分支 `main @ cbea283`
+
+## 当前进度（Block A 主体已完成）
+
+| 模块 | 状态 | 说明 |
+|------|:----:|------|
+| 胸带数据采集 (HSR 1A2) | ✅ | 呼吸波 / 姿态 / ECG / 加速度稳定 |
+| SpO2 / 脉率 | ✅ | 经 PC-68B 转发（胸带 HSRG 变体自身无 PPG，已实测验证） |
+| 打鼾检测 (YAMNet) | ✅ | Apple Silicon Metal 加速，阈值 0.30，±0.25 s 推理 |
+| 闭环控制器 | ✅ | armed → triggered → playing → observe → cooldown |
+| 连发节奏优化 | ✅ | 首次 8 s 蓄力，无反应后 `retry_trigger_hold_s=2 s`，间隔 ~8 s |
+| 活跃时段门控 | ✅ | 支持 N2 时段 (如 01:00–04:30) |
+| Web UI / 回放审核 tab | ✅ | Vital 卡片 + 鼾声 SVG 时间线 + 回放多通道波形 |
+| 每次触发 ±N s 快照 | ✅ | 胸呼吸 / SpO2 / 鼾声概率 / 麦克录音 / 干预音 |
+| 夜结束自动分析 | ✅ | `scripts/analyze_night.py` → summary + per-strategy 表 |
+| 一键部署包 (.command) | ✅ | 非技术被试也能跑 |
+| 文档 | ✅ | `docs/` 9 个 md，含协议实测报告 |
+
+## 未完成 / 待研究
+
+- 🟡 **手机麦克风**：当前 pilot 用 Mac 内置麦 + 耳机输出（输入输出走两条独立设备，回避 macOS 蓝牙 HFP 限制）。下一步评估用 Android 手机当无线麦（推流到 Mac），让被试床头摆位更灵活；iPhone 方向暂搁置（连续互通强制同 Apple ID，对被试不友好）。
+- 🟡 胸带 HSRG 固件不给 `resp_rate` / `gesture` / 电池字段（都是 0 或跳变），上层已用 `accel` 算姿态 + RIP 峰检测算呼吸率兜底；长期建议换官方固件或基础版胸带。
+- ⚪ Block B（微唤醒截断）代码骨架在，未启用。
+
+---
+
+本文件以下部分描述后续三个增量方向，按优先级排序。
 
 ## 1 · OSA 事件检测（Phase 2）
 
@@ -86,9 +111,19 @@ Web 回放 tab 肉眼抽查，迭代阈值。
 
 ## 4 · 其他工程改进（零散）
 
+- [ ] **荣耀耳机实测**：验证是否能做"单耳机同时收放音"，若可行则打开产品形态。
 - [ ] 实习生接手 1 · 写 `ApneaDetector` 和 `MovementDetector`
-- [ ] 把 PC-68B 驱动封装成插件模式，允许运行时禁用
 - [ ] 把 ui/designer.py 正式标记 deprecated 并从 README 移除
 - [ ] SessionRecorder 增加阶段性 summary（每 30 min 写一次 meta，防 crash）
 - [ ] 支持多设备同步（多个胸带、多个被试——如果以后做对照实验）
 - [ ] 为非 macOS 目标编写 sounddevice 备份驱动（Linux pilot）
+
+## 近期里程碑（可作为汇报节奏）
+
+| 周 | 目标 |
+|----|------|
+| W1 (本周) | 荣耀耳机实测 + 2 位被试 pilot 夜测；分析报告与 AirPods 对比 |
+| W2 | 根据 pilot 数据调参（`retry_trigger_hold_s` / `response_window_s` / 活跃时段） |
+| W3-4 | 实习生落地 `ApneaDetector` + `MovementDetector`（路线图 §1） |
+| W5 | Block A 触发条件升级为"Apnea/Hypopnea + 仰卧"，真 OSA 干预 |
+| W6+ | Block B 开启，两种策略 A/B 对照 |

@@ -8,7 +8,6 @@ depends on a specific driver.
 
 Topics published:
   * chestband.data      payload = DataPacket (per-second)
-  * oximeter.reading    payload = OxiReading
   * headset.imu         payload = dict{accel, gyro} (TBD when we get HW)
   * sensor.status       payload = {name, status, detail}
 
@@ -118,46 +117,6 @@ class ChestBandSensor(Sensor):
         if self.loop:
             asyncio.run_coroutine_threadsafe(_disc(), self.loop)
         self._set_status('stopped')
-
-
-# ─────────────────────────── Oximeter ─────────────────────────────────────
-
-
-class OximeterSensor(Sensor):
-    """Adapter for OximeterBLE. Vendor protocol not solved yet, so if the
-    device doesn't push any bytes, we just stay 'connecting' and emit nothing.
-    Offline CSV import (PC software) can feed the same topic via `inject`."""
-
-    name = 'oximeter'
-
-    def __init__(self, ble, loop: asyncio.AbstractEventLoop):
-        super().__init__()
-        self.ble = ble
-        self.loop = loop
-
-    def start(self):
-        if self.bus is None:
-            raise RuntimeError("attach(bus) before start()")
-
-        def _on_reading(r):
-            self._emit('oximeter.reading', r)
-
-        self.ble.on_reading = _on_reading
-        self._set_status('streaming')
-
-    def stop(self):
-        async def _disc():
-            try:
-                await self.ble.disconnect()
-            except Exception:
-                pass
-        if self.loop:
-            asyncio.run_coroutine_threadsafe(_disc(), self.loop)
-        self._set_status('stopped')
-
-    def inject(self, reading):
-        """Push a reading obtained from offline USB export."""
-        self._emit('oximeter.reading', reading)
 
 
 # ─────────────────────────── Headset (stub) ───────────────────────────────

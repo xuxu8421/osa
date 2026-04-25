@@ -7,7 +7,6 @@ Layout (all files under `sessions/<session_id>/`):
   events.jsonl     every pipeline event, time-ordered, one JSON per line
   chestband.npz    concatenated waveforms (ECG×4, resp, accel) + vitals CSV
   chestband.csv    one row per second: ts, SpO2, PR, RR, temp, gesture, batt
-  oximeter.csv     one row per oximeter reading
   interventions.jsonl  what was played, when, with which params
 
 The design goal is "append-cheap, seek-free". We subscribe to EventBus topics
@@ -87,14 +86,6 @@ class SessionRecorder:
                 'ts', 'packet_sn', 'spo2_pct', 'pulse_rate', 'resp_rate',
                 'heart_rate', 'gesture', 'temperature', 'battery_mv',
             ])
-        self._oxi_csv = open(self.dir / 'oximeter.csv', 'a', newline='',
-                             encoding='utf-8')
-        self._oxi_w = csv.writer(self._oxi_csv)
-        if self._oxi_csv.tell() == 0:
-            self._oxi_w.writerow([
-                'ts', 'spo2_pct', 'pulse_rate', 'pi',
-                'pleth', 'finger_out', 'probe_error',
-            ])
         self._int_f = open(self.dir / 'interventions.jsonl', 'a', buffering=1,
                            encoding='utf-8')
 
@@ -115,7 +106,6 @@ class SessionRecorder:
         # Subscribe
         self._unsubs = [
             bus.subscribe('chestband.data', self._on_chestband),
-            bus.subscribe('oximeter.reading', self._on_oximeter),
             bus.subscribe('intervention.triggered', self._on_intervention),
             bus.subscribe('posture.change', self._on_generic),
             bus.subscribe('sensor.status', self._on_generic),
@@ -132,7 +122,6 @@ class SessionRecorder:
 
         # Stats
         self.packet_count = 0
-        self.oxi_count = 0
         self.intervention_count = 0
 
     # ── subscribers ──
@@ -181,19 +170,6 @@ class SessionRecorder:
                 'gesture': getattr(v, 'gesture', None) if v else None,
             },
         }, default=_json_default) + '\n')
-
-    def _on_oximeter(self, ev: Event):
-        r = ev.payload
-        self.oxi_count += 1
-        self._oxi_w.writerow([
-            f'{ev.t:.3f}',
-            getattr(r, 'spo2_pct', ''),
-            getattr(r, 'pulse_rate', ''),
-            getattr(r, 'pi', ''),
-            getattr(r, 'pleth', ''),
-            getattr(r, 'finger_out', ''),
-            getattr(r, 'probe_error', ''),
-        ])
 
     def _on_intervention(self, ev: Event):
         self.intervention_count += 1
@@ -254,7 +230,7 @@ class SessionRecorder:
         self._stop.set()
         self._flusher.join(timeout=self.FLUSH_SECS * 2)
         self._flush_waves()
-        for f in (self._events, self._cb_csv, self._oxi_csv, self._int_f):
+        for f in (self._events, self._cb_csv, self._int_f):
             try: f.close()
             except Exception: pass
 
@@ -266,7 +242,6 @@ class SessionRecorder:
                 'started_at': self.meta.started_at,
                 'ended_at': ended,
                 'chestband_packets': self.packet_count,
-                'oximeter_readings': self.oxi_count,
                 'interventions': self.intervention_count,
                 'blocks': self._block_idx,
             }, f, ensure_ascii=False, indent=2)
