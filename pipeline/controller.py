@@ -82,8 +82,16 @@ class ControllerConfig:
     # hold window — protects against single-event false positives like a
     # cough or door slam that YAMNet briefly flags as "Snoring".
     confirm_snore_bouts: int = 1
-    # Strategy pool — randomly chosen on trigger
+    # Strategy pool — randomly chosen on trigger by default. When
+    # `strategy_rotation_s > 0` the pool is instead cycled in order
+    # (see below).
     strategy_pool: tuple = ('P1', 'P2', 'P3')
+    # If > 0, ignore random selection and rotate through `strategy_pool`
+    # in order, with each strategy active for this many seconds, measured
+    # from `session_epoch_t`. Enables single-night A/B/C comparison
+    # ("每个小时换一种声音, 看哪种翻身率高"). Wraps after the last
+    # strategy so a long night cycles repeatedly.
+    strategy_rotation_s: float = 0.0
     # Preferred playback direction; 'opposite' = play to opposite-of-current
     # posture (side direction only), 'random' = random L/R, 'left'/'right' =
     # fixed side
@@ -140,6 +148,11 @@ class ClosedLoopController:
         # initial `trigger_hold_s`.
         self._retry_mode: bool = False
         self._idle_since: float = 0.0
+        # Reference timestamp for rotation indexing. Defaults to "now"
+        # so rotation works even without a session — but runtime resets
+        # this to session_start_t when a session begins so each subject's
+        # P1 phase starts at minute 0 of their own night.
+        self._session_epoch_t: float = time.time()
         # Timestamp of the last positive snoring reading (from the detector).
         # Used by `_snoring_ok` to tolerate the gaps between snore events.
         self._last_snore_at: float = 0.0
@@ -174,12 +187,41 @@ class ClosedLoopController:
         """Ignore cooldown/hold and fire immediately (dev/test aid)."""
         self._fire(strategy=strategy, direction=direction, reason='manual')
 
+    def set_session_epoch(self, t: float) -> None:
+        """Reset the rotation reference time. Call at session start so
+        rotation indexing aligns with subject's own clock."""
+        self._session_epoch_t = float(t)
+
+    def _rotation_state(self) -> Optional[dict]:
+        """If strategy rotation is enabled, return its current view:
+        active strategy + how long until the next switch + next strategy.
+        Returns None when rotation is disabled (random selection)."""
+        rot_s = float(getattr(self.cfg, 'strategy_rotation_s', 0.0) or 0.0)
+        pool = list(self.cfg.strategy_pool or [])
+        if rot_s <= 0 or len(pool) < 2:
+            return None
+        elapsed = max(0.0, time.time() - self._session_epoch_t)
+        idx = int(elapsed // rot_s) % len(pool)
+        in_block = elapsed - (elapsed // rot_s) * rot_s
+        return {
+            'active': True,
+            'rotation_s': rot_s,
+            'pool': pool,
+            'index': idx,
+            'current': pool[idx],
+            'next': pool[(idx + 1) % len(pool)],
+            'time_in_block_s': in_block,
+            'time_until_next_s': max(0.0, rot_s - in_block),
+            'session_elapsed_s': elapsed,
+        }
+
     def status(self) -> dict:
         snore_age = (time.time() - self._last_snore_at
                      if self._last_snore_at > 0 else float('inf'))
         effective_hold = (self.cfg.retry_trigger_hold_s
                           if self._retry_mode
                           else self.cfg.trigger_hold_s)
+        rotation = self._rotation_state()
         return {
             'state': self.state,
             'enabled': self.cfg.enabled,
@@ -201,6 +243,10 @@ class ClosedLoopController:
             'retry_trigger_hold_s': float(self.cfg.retry_trigger_hold_s),
             'confirm_snore_bouts': int(self.cfg.confirm_snore_bouts),
             'snore_bouts_since_armed': int(self._snore_bouts_since_armed),
+            'strategy_pool': list(self.cfg.strategy_pool),
+            'strategy_rotation_s': float(
+                getattr(self.cfg, 'strategy_rotation_s', 0.0) or 0.0),
+            'rotation': rotation,
         }
 
     # ── trigger-condition gating ──
@@ -400,9 +446,8 @@ class ClosedLoopController:
               direction: Optional[str] = None):
         if time.time() < self._cooldown_until:
             return
-        # Pick strategy + direction
         if strategy is None:
-            strategy = random.choice(self.cfg.strategy_pool)
+            strategy = self._select_strategy()
         sdef = STRATEGY_REGISTRY.get(strategy)
         if sdef is None:
             return
@@ -431,6 +476,20 @@ class ClosedLoopController:
             args=(strategy, direction),
             daemon=True,
         ).start()
+
+    def _select_strategy(self) -> str:
+        """Choose which strategy to play next.
+
+        Default: random pick from `strategy_pool`. When rotation is
+        enabled (rotation_s > 0 and pool has ≥ 2 entries), instead pick
+        deterministically by time block since session start so each
+        strategy gets one continuous block per night.
+        """
+        pool = list(self.cfg.strategy_pool) or ['P1']
+        rot = self._rotation_state()
+        if rot is not None:
+            return rot['current']
+        return random.choice(pool)
 
     def _pick_direction(self, sdef) -> str:
         if not getattr(sdef, 'has_direction', True):

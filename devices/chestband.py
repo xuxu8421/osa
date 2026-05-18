@@ -17,6 +17,7 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 
 from .chestband_protocol import (
     PacketParser, DataPacket, build_register_response, build_rtc_set,
+    build_status_ctrl, build_peripheral_unbind,
 )
 
 
@@ -33,6 +34,10 @@ class ChestBandBLE:
         self.device: Optional[BLEDevice] = None
         self._write_char = None
         self._notify_char = None
+        # External hook fired when the BLE link drops (peer powered off,
+        # out of range, etc.). Set by OsaRuntime so the UI status can
+        # flip from connected → idle/error without polling.
+        self.on_disconnect: Optional[Callable[[], None]] = None
 
         self.parser.on_registration = self._on_registration
 
@@ -70,7 +75,19 @@ class ChestBandBLE:
         """Connect to a device, discover services, find data characteristic."""
         self.device = device
         print(f"连接到 {device.name} ({device.address})...")
-        self.client = BleakClient(device, timeout=15.0)
+
+        def _bleak_disconnected(_client):
+            print(f"BLE 链路断开: {device.name} ({device.address})")
+            cb = self.on_disconnect
+            if cb is not None:
+                try:
+                    cb()
+                except Exception as e:
+                    print(f"on_disconnect 回调异常: {e}")
+
+        self.client = BleakClient(
+            device, timeout=15.0,
+            disconnected_callback=_bleak_disconnected)
         await self.client.connect()
         print("已连接")
 
@@ -125,20 +142,80 @@ class ChestBandBLE:
         self.parser.feed(bytes(data))
 
     async def _on_registration(self, device_id_bytes: bytes):
-        """Respond to device registration request."""
+        """Respond to device registration request.
+
+        Empirically the chest band drops the RTC frame if it arrives in
+        the same write burst as the registration response (firmware is
+        still chewing on registration). The result is `device_status`
+        bit 6 (时间设置标志) staying lit, which on this HSRG variant
+        triggers a recurring beep.
+
+        Fix: insert a short gap between the two writes, and schedule a
+        second redundant RTC send a couple of seconds later in case the
+        device drops the first one anyway.
+        """
         if self._write_char and self.client and self.client.is_connected:
             resp = build_register_response(device_id_bytes)
             try:
                 await self.client.write_gatt_char(
                     self._write_char.uuid, resp)
                 print(f"已响应设备注册: DID={device_id_bytes.hex()}")
-                # Also set RTC
+                await asyncio.sleep(0.4)  # let firmware settle
                 rtc = build_rtc_set(device_id_bytes)
                 await self.client.write_gatt_char(
                     self._write_char.uuid, rtc)
-                print("已同步 RTC 时间")
+                print("已同步 RTC 时间 (#1)")
+
+                async def _retry_rtc():
+                    await asyncio.sleep(2.0)
+                    try:
+                        if self.client and self.client.is_connected:
+                            await self.client.write_gatt_char(
+                                self._write_char.uuid, rtc)
+                            print("已同步 RTC 时间 (#2 backup)")
+                    except Exception as e:
+                        print(f"RTC backup 写入失败: {e}")
+
+                asyncio.create_task(_retry_rtc())
             except Exception as e:
                 print(f"写入失败: {e}")
+
+    async def send_status_ctrl(self, switches: int = 0x00,
+                               b10: int = 0x00, b11: int = 0x00,
+                               b12: int = 0x00) -> bool:
+        """Send 0x0B status-indicator switches packet. The 3 "reserved"
+        bytes b10/b11/b12 are exposed as well so bit-scanning can probe
+        vendor-specific flags hidden there (the doc says they should be
+        zero but HSRG firmware diverges from spec on multiple fields).
+        """
+        if not (self._write_char and self.client
+                and self.client.is_connected):
+            return False
+        did_bytes = getattr(self.parser, 'last_did_bytes', None) or b'\x00\x00\x00\x00'
+        pkt = build_status_ctrl(did_bytes, switches, b10, b11, b12)
+        try:
+            await self.client.write_gatt_char(self._write_char.uuid, pkt)
+            return True
+        except Exception as e:
+            print(f"send_status_ctrl 失败: {e}")
+            return False
+
+    async def send_peripheral_unbind(self,
+                                     peripheral_type: int = 0x01) -> bool:
+        """Send 0x0D unbind for a paired BT peripheral (default: PC-68B
+        SpO2 oximeter). Returns True on success.
+        """
+        if not (self._write_char and self.client
+                and self.client.is_connected):
+            return False
+        did = getattr(self.parser, 'last_did_bytes', None) or b'\x00\x00\x00\x00'
+        pkt = build_peripheral_unbind(did, peripheral_type)
+        try:
+            await self.client.write_gatt_char(self._write_char.uuid, pkt)
+            return True
+        except Exception as e:
+            print(f"send_peripheral_unbind 失败: {e}")
+            return False
 
     async def disconnect(self):
         if self.client and self.client.is_connected:

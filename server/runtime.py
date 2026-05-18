@@ -57,6 +57,47 @@ OUTPUT_DIR = ROOT / 'output'
 SESSIONS_DIR = ROOT / 'sessions'
 STRATEGY_ORDER = ['P1', 'P2', 'P3', 'L1', 'L2']
 
+# Experiment modes
+#   'A' — Block A 完整版: 胸带 + 麦克风 + (PC-68B SpO2). 触发 = 仰卧 ∧ 持续打鼾.
+#   'S' — 简化版: 仅胸带 + 耳机. 触发 = 仰卧持续 N 秒. 不检测鼾声, 不依赖 PC-68B.
+EXPERIMENT_MODES = ('A', 'S')
+
+# Per-mode default controller config. Switching mode auto-applies these as a
+# preset (they remain user-tunable from the UI afterwards). The S defaults are
+# more conservative on hold/observe because we no longer have snoring as an
+# additional gating signal — without it, a brief roll through supine could
+# fire a false-positive intervention too easily on the A defaults.
+_MODE_DEFAULTS = {
+    'A': {
+        'trigger_hold_s': 8.0,
+        'retry_trigger_hold_s': 2.0,
+        'response_window_s': 10.0,
+        'cooldown_no_response_s': 5.0,
+        'require_snoring': True,
+        'confirm_snore_bouts': 1,
+        # Block-A nights typically compare strategies → random over the
+        # full posture pool.
+        'strategy_pool': ['P1', 'P2', 'P3'],
+        # No automatic rotation by default in A mode — random selection
+        # mixes strategies inside a single posture episode for free.
+        'strategy_rotation_min': 0.0,
+    },
+    'S': {
+        'trigger_hold_s': 15.0,
+        'retry_trigger_hold_s': 5.0,
+        'response_window_s': 15.0,
+        'cooldown_no_response_s': 8.0,
+        'require_snoring': False,
+        'confirm_snore_bouts': 0,
+        # S mode is meant for *single-night, multi-strategy* comparison.
+        # Default to all 3 posture strategies + a 60-minute rotation:
+        # the controller cycles P1 → P2 → P3 → P1 … as the night
+        # progresses, so each strategy gets one contiguous block.
+        'strategy_pool': ['P1', 'P2', 'P3'],
+        'strategy_rotation_min': 60.0,
+    },
+}
+
 
 # Max posture/chest history kept for plotting
 CHEST_BUF_SECS = 30
@@ -159,7 +200,44 @@ class OsaRuntime:
             'confirm_snore_bouts': 1,
             'active_window_start': '',
             'active_window_end': '',
+            # Strategy pool: list of strategy keys the controller draws
+            # from. With `strategy_rotation_min == 0` they are picked at
+            # random per trigger (legacy behaviour); with rotation > 0
+            # they are cycled in order, one per `rotation_min` block of
+            # session time. Single-element pool = fixed strategy.
+            'strategy_pool': ['P1', 'P2', 'P3'],
+            'strategy_rotation_min': 0.0,
         }
+
+        # Continuous-silence-mode bookkeeping. While `_silence_loop_task`
+        # is non-None a coroutine on the BLE loop re-sends the 0x0B
+        # silence frame every `_silence_loop_period_s`. See
+        # `chest_silence_loop_set`.
+        self._silence_loop_task = None
+        self._silence_loop_period_s: float = 1.0
+
+        # Auto-reconnect bookkeeping. After a successful connect we
+        # remember the address; if the BLE link drops mid-session the
+        # disconnect callback spawns `_chest_reconnect_loop` on the BLE
+        # event loop. Explicit `chest_disconnect()` clears the address
+        # so we don't fight the user's manual disconnect.
+        self._ble_last_address: Optional[str] = None
+        self._ble_reconnect_task = None              # asyncio.Task / Future
+        self._ble_reconnect_active: bool = False
+        self._ble_reconnect_period_s: float = 8.0
+
+        # Active experiment mode. 'A' = full Block A (snoring + supine);
+        # 'S' = simple posture-only (chestband + earphones, no mic). Mode
+        # is applied as a preset to controller config and also pauses /
+        # restarts the YAMNet detector so the mic is freed in S mode.
+        self.experiment_mode: str = 'A'
+
+        # Last time a chestband data packet was decoded. Used both to
+        # show the UI a "包停了 N 秒" hint and to drive a watchdog that
+        # auto-flips _ble_state → 'error' if the link silently dies (BLE
+        # disconnect callback should also catch this, but the watchdog
+        # protects against bleak missing the disconnect on macOS).
+        self._chest_last_pkt_t: float = 0.0
 
         self.bus.subscribe('posture.sample', self._on_posture_sample)
         self.bus.subscribe('posture.change', self._on_posture_change)
@@ -269,6 +347,7 @@ class OsaRuntime:
         dp: DataPacket = ev.payload
         self._ble_latest = dp
         self._ble_pkt_count += 1
+        self._chest_last_pkt_t = float(ev.t)
         v = dp.vitals
         lv = self._ble_latest_vitals
         now_t = float(ev.t)
@@ -286,6 +365,15 @@ class OsaRuntime:
         if 28 <= (v.temperature or 0) <= 42:
             lv['temp_c'] = round(float(v.temperature), 1)
         lv['gesture'] = v.gesture
+        # Decode the device_status byte (alert flags) so the UI can
+        # show *which* alert source is currently active. Lets the user
+        # aim physical fixes (re-wet electrodes, re-clip PC-68B, etc.).
+        from devices.chestband_protocol import decode_device_status
+        try:
+            lv['device_status'] = decode_device_status(
+                int(getattr(v, 'device_status', 0) or 0))
+        except Exception:
+            pass
 
         if dp.chest_resp is not None and len(dp.chest_resp) > 0:
             self._chest_buf.extend([float(x) for x in dp.chest_resp])
@@ -316,6 +404,19 @@ class OsaRuntime:
         sn = self.snore.metrics()
         sess_dur = (time.time() - self.session_start_t) if self.recorder else 0.0
 
+        # Watchdog: bleak's disconnected_callback is the primary path
+        # for catching a silent BLE drop, but on macOS it occasionally
+        # misses the event entirely. As a safety net, if we *think*
+        # we're connected yet haven't seen a chestband data packet for
+        # > 6 seconds, treat the link as dead — chest band normally
+        # streams at ~1 packet/s, so a 6 s gap means something's wrong.
+        CHEST_PKT_TIMEOUT_S = 6.0
+        if (self._ble_connected
+                and self._chest_last_pkt_t > 0
+                and (time.time() - self._chest_last_pkt_t)
+                    > CHEST_PKT_TIMEOUT_S):
+            self._handle_chest_disconnect()
+
         # SpO2 freshness: values older than 5 s are considered stale.
         STALE_S = 5.0
         now_t = time.time()
@@ -335,10 +436,20 @@ class OsaRuntime:
 
         return {
             't': now_t,
+            'experiment': {
+                'mode': self.experiment_mode,
+                'modes': list(EXPERIMENT_MODES),
+                'mode_label': ('A · 仰卧+鼾声 (Block A)' if self.experiment_mode == 'A'
+                               else 'S · 仅姿态 (简化版)'),
+                'snore_active': self.experiment_mode == 'A',
+                'spo2_required': self.experiment_mode == 'A',
+            },
             'chestband': {
                 'state': self._ble_state,
                 'err': self._ble_err,
                 'pkt': self._ble_pkt_count,
+                'pkt_age_s': (round(time.time() - self._chest_last_pkt_t, 1)
+                              if self._chest_last_pkt_t > 0 else None),
                 'vitals': vitals_out,
                 'chest_t': chest_t,
                 'chest_y': chest_plot,
@@ -392,6 +503,7 @@ class OsaRuntime:
         cfg = dict(self._controller_cfg_values)
         posture = self._live['posture']
         posture_ok = posture in ('supine',)
+        mode = self.experiment_mode
         try:
             snore_now = bool(self.snore.is_snoring())
         except Exception:
@@ -433,10 +545,18 @@ class OsaRuntime:
             {'key': 'posture',  'label': '姿态: 仰卧',
              'ok': posture_ok,
              'hint': f'当前 {posture}' if not posture_ok else ''},
-            {'key': 'snoring',  'label': '检测到打鼾',
-             'ok': (snore_ok or not snore_required),
-             'hint': _snore_hint(snore_required, snore_ok, snore_now,
-                                 age, recent_s)},
+        ]
+        # Snoring badge only shown when the mode actually consumes it. In
+        # 'S' (posture-only) mode the mic stream is paused, so the badge
+        # would be permanently grey and confusing.
+        if mode != 'S':
+            conds.append({
+                'key': 'snoring', 'label': '检测到打鼾',
+                'ok': (snore_ok or not snore_required),
+                'hint': _snore_hint(snore_required, snore_ok, snore_now,
+                                    age, recent_s),
+            })
+        conds.extend([
             {'key': 'cooldown', 'label': '不在冷却中',
              'ok': cooldown_left <= 0.01,
              'hint': (f'冷却剩余 {cooldown_left:.1f}s'
@@ -449,10 +569,11 @@ class OsaRuntime:
                       else ('未设置窗口，全天启用' if not (
                           stat.get('active_window_start') and
                           stat.get('active_window_end')) else ''))},
-        ]
+        ])
         all_ready = all(c['ok'] for c in conds)
         return {
             'state': state,
+            'mode': mode,
             'last_strategy': self._live['last_strategy'],
             'last_direction': self._live['last_direction'],
             'config': cfg,
@@ -476,6 +597,7 @@ class OsaRuntime:
             'retry_trigger_hold_s': float(stat.get(
                 'retry_trigger_hold_s',
                 cfg.get('retry_trigger_hold_s', 2.0))),
+            'rotation': stat.get('rotation'),
         }
 
     @staticmethod
@@ -555,9 +677,49 @@ class OsaRuntime:
                     except Exception:
                         pass
 
+                # BLE link dropped (peer powered off, out of range...).
+                # Reflect immediately in our public state so UI flips
+                # from connected → error without waiting for a manual
+                # action.  Marshal back to the BLE loop only for the
+                # bleak cleanup; runtime-state mutation can happen on
+                # whatever thread bleak invoked the callback.
+                self.ble.on_disconnect = self._handle_chest_disconnect
+
                 await self.ble.start_receiving(_on_data)
                 self._ble_connected = True
                 self._ble_state = 'connected'
+                self._chest_last_pkt_t = time.time()
+                # Remember address for auto-reconnect after silent drop.
+                self._ble_last_address = address
+
+                # Auto-resync RTC ~2s after the BLE link is up. The
+                # registration-time RTC frame frequently gets dropped on
+                # this HSRG variant (firmware busy parsing the reg
+                # response), and that leaves device_status bit 6
+                # (时间设置标志) lit, which makes the chest band beep
+                # every ~3s. Sending a second RTC after the data stream
+                # has settled reliably clears it.
+                async def _belated_rtc():
+                    await asyncio.sleep(2.0)
+                    try:
+                        if (self.ble is None or self.ble.client is None
+                                or not self.ble.client.is_connected
+                                or self.ble._write_char is None):
+                            return
+                        from devices.chestband_protocol import build_rtc_set
+                        did = (getattr(self.ble.parser, 'last_did_bytes', None)
+                               or b'\x00\x00\x00\x00')
+                        pkt = build_rtc_set(did)
+                        await self.ble.client.write_gatt_char(
+                            self.ble._write_char.uuid, pkt)
+                        print(f"[connect] auto-resync RTC OK "
+                              f"(DID={did.hex().upper()})")
+                        self._push_event(
+                            ">> 自动同步 RTC (清 bit6 时间设置标志)")
+                    except Exception as e:
+                        print(f"[connect] auto-resync RTC failed: {e}")
+
+                asyncio.create_task(_belated_rtc())
             except Exception as e:
                 self._ble_connected = False
                 self._ble_state = 'error'
@@ -566,11 +728,396 @@ class OsaRuntime:
         self._submit(_do())
         return {'ok': True}
 
+    def chest_silence(self, keep_spo2: bool = True,
+                      switches: Optional[int] = None,
+                      b10: int = 0, b11: int = 0, b12: int = 0) -> dict:
+        """Send a 0x0B status-indicator switches frame.
+
+        keep_spo2: if True, leave bit 6 ("BT pulse-oximeter") set so
+            the chest band keeps relaying PC-68B SpO2.
+        switches: explicit raw byte 9, overrides keep_spo2.
+        b10/b11/b12: optional values for the documented "reserved" bytes.
+            Some HSRG firmwares stash silencing bits here, so the
+            scanner can poke at them. Default 0 = stock spec.
+        """
+        if not self._ble_connected or self.ble is None:
+            return {'ok': False, 'err': '胸带未连接'}
+        if switches is None:
+            switches = (1 << 6) if keep_spo2 else 0x00
+        switches &= 0xFF
+        b10 &= 0xFF; b11 &= 0xFF; b12 &= 0xFF
+
+        from devices.chestband_protocol import build_status_ctrl
+        did_bytes = (getattr(self.ble.parser, 'last_did_bytes', None)
+                     or b'\x00\x00\x00\x00')
+        pkt = build_status_ctrl(did_bytes, switches, b10, b11, b12)
+        pkt_hex = pkt.hex(' ').upper()
+        did_hex = did_bytes.hex().upper()
+        print(f"[silence] DID={did_hex} sw=0x{switches:02X} "
+              f"b10=0x{b10:02X} b11=0x{b11:02X} b12=0x{b12:02X} "
+              f"frame={pkt_hex}")
+
+        async def _do():
+            try:
+                ok = await self.ble.send_status_ctrl(
+                    switches=switches, b10=b10, b11=b11, b12=b12)
+                return ok, ''
+            except Exception as e:
+                self._ble_err = f'silence: {e}'
+                return False, str(e)
+
+        fut = self._submit(_do())
+        ok, err = False, ''
+        if fut is not None:
+            try:
+                ok, err = fut.result(timeout=3.0)
+            except Exception as e:
+                ok, err = False, f'await: {e}'
+        msg = (f">> 已发送 0x0B 帧 sw=0x{switches:02X} b10=0x{b10:02X} "
+               f"b11=0x{b11:02X} b12=0x{b12:02X}  写入 "
+               f"{'OK' if ok else '失败'}")
+        self._push_event(msg)
+        return {
+            'ok': bool(ok),
+            'switches': int(switches),
+            'switches_hex': f'0x{switches:02X}',
+            'b10': int(b10), 'b11': int(b11), 'b12': int(b12),
+            'keep_spo2': bool(keep_spo2),
+            'did_hex': did_hex,
+            'frame_hex': pkt_hex,
+            'err': err if not ok else '',
+        }
+
+    def chest_silence_loop_set(self, on: bool,
+                               period_s: float = 1.0) -> dict:
+        """Toggle a background coroutine that re-sends the 0x0B silence
+        frame every `period_s`. Some firmwares only respect a transient
+        "0=off" and revert; continuous re-assertion can hold them down.
+        """
+        period_s = max(0.2, float(period_s))
+        was_running = self._silence_loop_task is not None
+        if on and not was_running:
+            self._silence_loop_period_s = period_s
+
+            async def _runner():
+                from devices.chestband_protocol import build_status_ctrl
+                while self._silence_loop_task is not None and self._ble_connected:
+                    try:
+                        if self.ble is not None:
+                            await self.ble.send_status_ctrl(switches=0x00)
+                    except Exception as e:
+                        print(f"[silence-loop] err: {e}")
+                    await asyncio.sleep(self._silence_loop_period_s)
+
+            self._silence_loop_task = self._submit(_runner())
+            self._push_event(
+                f">> 持续静音模式 ON  (每 {period_s:.1f}s 重发 0x0B = 0x00)")
+        elif not on and was_running:
+            t = self._silence_loop_task
+            self._silence_loop_task = None
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._push_event(">> 持续静音模式 OFF")
+        return {'ok': True,
+                'on': self._silence_loop_task is not None,
+                'period_s': self._silence_loop_period_s}
+
+    def chest_unbind_all_peripherals(self) -> dict:
+        """Send 4 unbind frames in a row (thermometer, SpO2, BP cuff,
+        spirometer). Tries to clear all four "外设连接断" bits at once."""
+        if not self._ble_connected or self.ble is None:
+            return {'ok': False, 'err': '胸带未连接'}
+        results = []
+
+        async def _do():
+            sent = []
+            for ptype, label in [
+                (0x00, '体温计'), (0x01, '血氧仪'),
+                (0x02, '血压计'), (0x03, '流速仪'),
+            ]:
+                try:
+                    ok = await self.ble.send_peripheral_unbind(
+                        peripheral_type=ptype)
+                except Exception as e:
+                    ok = False
+                    self._push_event(f"unbind {label} 异常: {e}")
+                sent.append({'type': ptype, 'label': label, 'ok': bool(ok)})
+                await asyncio.sleep(0.15)
+            return sent
+
+        fut = self._submit(_do())
+        if fut is not None:
+            try:
+                results = fut.result(timeout=5.0)
+            except Exception as e:
+                return {'ok': False, 'err': f'await: {e}'}
+        n_ok = sum(1 for r in results if r['ok'])
+        self._push_event(f">> 解绑全部外设: {n_ok}/4 写入成功")
+        return {'ok': n_ok > 0, 'results': results}
+
+    def chest_resync_rtc(self) -> dict:
+        """Re-send the 0x09 RTC time-set frame. Sometimes the chest band
+        misses the original sync sent during registration handshake.
+        Goal: clear `device_status` bit 6 (时间设置标志).
+        """
+        if not self._ble_connected or self.ble is None:
+            return {'ok': False, 'err': '胸带未连接'}
+        from devices.chestband_protocol import build_rtc_set
+        did_bytes = (getattr(self.ble.parser, 'last_did_bytes', None)
+                     or b'\x00\x00\x00\x00')
+        pkt = build_rtc_set(did_bytes)
+
+        async def _do():
+            try:
+                if self.ble._write_char and self.ble.client \
+                        and self.ble.client.is_connected:
+                    await self.ble.client.write_gatt_char(
+                        self.ble._write_char.uuid, pkt)
+                    return True, ''
+                return False, 'write char unavailable'
+            except Exception as e:
+                return False, str(e)
+
+        fut = self._submit(_do())
+        ok, err = False, ''
+        if fut is not None:
+            try:
+                ok, err = fut.result(timeout=3.0)
+            except Exception as e:
+                ok, err = False, str(e)
+        self._push_event(f">> 重发 RTC 同步  {'OK' if ok else 'FAIL: ' + err}")
+        return {'ok': bool(ok), 'frame_hex': pkt.hex(' ').upper(),
+                'err': err if not ok else ''}
+
+    def chest_unbind_peripheral(self, peripheral_type: int = 0x01) -> dict:
+        """Send 0x0D BT-peripheral-unbind frame. Default unbinds the
+        paired pulse oximeter (PC-68B). Some firmwares stop alerting
+        "missing peripheral" after this.
+        """
+        if not self._ble_connected or self.ble is None:
+            return {'ok': False, 'err': '胸带未连接'}
+
+        async def _do():
+            try:
+                ok = await self.ble.send_peripheral_unbind(
+                    peripheral_type=peripheral_type)
+                return ok, ''
+            except Exception as e:
+                return False, str(e)
+
+        fut = self._submit(_do())
+        ok, err = False, ''
+        if fut is not None:
+            try:
+                ok, err = fut.result(timeout=3.0)
+            except Exception as e:
+                ok, err = False, f'await: {e}'
+        msg = (f">> 已发送 0x0D 外设解绑帧 "
+               f"(type=0x{peripheral_type:02X})  写入 "
+               f"{'OK' if ok else '失败'}")
+        self._push_event(msg)
+        return {'ok': bool(ok),
+                'peripheral_type': int(peripheral_type),
+                'err': err if not ok else ''}
+
+    def _handle_chest_disconnect(self) -> None:
+        """Called by bleak's disconnected_callback when the BLE link
+        silently drops (chest band powered off, out of range, …).
+
+        Behaviour:
+          - flip state to 'error', surface to UI
+          - emit `chestband.disconnect` so SessionRecorder logs the
+            event with a real wall-clock timestamp (without this the
+            outage just appears as a gap in the data and we have to
+            grep for missing rows)
+          - if `_ble_last_address` is set (i.e. the user didn't ask
+            for an explicit disconnect), spawn `_chest_reconnect_loop`
+            on the BLE event loop. That coroutine retries until either
+            success or `_ble_last_address` gets cleared.
+        """
+        if not self._ble_connected and self._ble_state in ('idle', 'error'):
+            return
+        self._ble_connected = False
+        self._ble_state = 'error'
+        if not self._ble_err:
+            self._ble_err = '胸带链路断开 (设备关机 / 超出蓝牙范围 / 电池耗尽)'
+        # Stop continuous-silence loop if it was running — meaningless
+        # without an active link, and prevents log spam.
+        try:
+            t = self._silence_loop_task
+            if t is not None:
+                self._silence_loop_task = None
+                t.cancel()
+        except Exception:
+            pass
+        try:
+            self._push_event(">> 胸带链路已断开 (BLE disconnect)")
+        except Exception:
+            pass
+        try:
+            self._last_error = {
+                'msg': '胸带链路已断开. 自动重连中…',
+                't': time.time(),
+            }
+        except Exception:
+            pass
+        # Persist the disconnect to events.jsonl for offline analysis.
+        try:
+            self.bus.emit('chestband.disconnect', {
+                'address': self._ble_last_address,
+                'reason': self._ble_err,
+            }, src='chestband')
+        except Exception:
+            pass
+        # Start auto-reconnect unless the user explicitly disconnected.
+        if self._ble_last_address and not self._ble_reconnect_active:
+            try:
+                fut = self._submit(self._chest_reconnect_loop())
+                self._ble_reconnect_task = fut
+            except Exception as e:
+                print(f"[reconnect] failed to schedule: {e}")
+
+    async def _chest_reconnect_loop(self):
+        """Background coroutine that re-establishes the BLE link after
+        a silent drop. Runs on the BLE event loop. Stops as soon as
+        either the link is back up or `_ble_last_address` gets cleared
+        by an explicit user disconnect.
+        """
+        if self._ble_reconnect_active:
+            return
+        self._ble_reconnect_active = True
+        attempts = 0
+        period = float(self._ble_reconnect_period_s)
+        try:
+            self._push_event(
+                f">> 自动重连胸带启动 (每 {period:.0f}s 一次)")
+            while True:
+                target = self._ble_last_address
+                if not target:
+                    self._push_event(">> 自动重连已停止 (用户断开)")
+                    return
+                if self._ble_state == 'connected':
+                    return
+                attempts += 1
+                t_attempt = time.time()
+                # Re-scan briefly so the BLEDevice handle is fresh —
+                # macOS bleak refuses to connect to a stale device
+                # object after an OS-level drop, and 4 s is enough to
+                # see a chest band that's still in advertising range.
+                ok = False
+                try:
+                    pairs = await ChestBandBLE.scan(
+                        timeout=4.0,
+                        named_only=True,
+                        chestband_only=False)
+                except Exception as e:
+                    print(f"[reconnect#{attempts}] scan failed: {e}")
+                    pairs = []
+                device = None
+                for dev, _ in pairs:
+                    if dev.address == target:
+                        device = dev
+                        break
+                if device is None:
+                    print(f"[reconnect#{attempts}] target {target} "
+                          f"not in scan; sleep {period:.0f}s")
+                    await asyncio.sleep(period)
+                    continue
+                # Connect. Reuse a fresh ChestBandBLE — old client may
+                # still hold dangling state from the previous link.
+                try:
+                    self._ble_state = 'connecting'
+                    self.ble = ChestBandBLE()
+                    await self.ble.connect(device)
+
+                    def _on_data(dp: DataPacket):
+                        try:
+                            self.bus.emit('chestband.data', dp,
+                                          src='chestband')
+                        except Exception:
+                            pass
+
+                    self.ble.on_disconnect = self._handle_chest_disconnect
+                    await self.ble.start_receiving(_on_data)
+                    self._ble_connected = True
+                    self._ble_state = 'connected'
+                    self._chest_last_pkt_t = time.time()
+                    self._ble_err = ''
+                    ok = True
+                except Exception as e:
+                    print(f"[reconnect#{attempts}] connect failed: {e}")
+                    self._ble_state = 'error'
+                    self._ble_err = f'重连失败: {e}'
+                if ok:
+                    elapsed = time.time() - t_attempt
+                    self._push_event(
+                        f">> 胸带自动重连成功 (第 {attempts} 次, "
+                        f"耗时 {elapsed:.1f}s)")
+                    try:
+                        self.bus.emit('chestband.reconnected', {
+                            'address': target,
+                            'attempts': attempts,
+                            'elapsed_s': round(elapsed, 2),
+                        }, src='chestband')
+                    except Exception:
+                        pass
+                    # Re-issue RTC after the new link settles, same
+                    # logic as initial connect — clears device_status
+                    # bit 6 so the chest band doesn't start beeping.
+                    async def _belated_rtc():
+                        await asyncio.sleep(2.0)
+                        try:
+                            if (self.ble is None or self.ble.client is None
+                                    or not self.ble.client.is_connected
+                                    or self.ble._write_char is None):
+                                return
+                            from devices.chestband_protocol import \
+                                build_rtc_set
+                            did = (getattr(self.ble.parser,
+                                           'last_did_bytes', None)
+                                   or b'\x00\x00\x00\x00')
+                            pkt = build_rtc_set(did)
+                            await self.ble.client.write_gatt_char(
+                                self.ble._write_char.uuid, pkt)
+                            self._push_event(
+                                ">> 重连后自动同步 RTC")
+                        except Exception as e:
+                            print(f"[reconnect] post-RTC failed: {e}")
+                    asyncio.create_task(_belated_rtc())
+                    return
+                await asyncio.sleep(period)
+        finally:
+            self._ble_reconnect_active = False
+            self._ble_reconnect_task = None
+
     def chest_disconnect(self) -> dict:
         if not self._ble_connected:
             return {'ok': False, 'err': 'not connected'}
         self._ble_connected = False
         self._ble_state = 'idle'
+        # User-initiated disconnect: stop any auto-reconnect attempts.
+        # Clearing _ble_last_address is what the reconnect loop checks
+        # to break out, so this is sufficient even if the loop is
+        # currently in the middle of a sleep.
+        self._ble_last_address = None
+        try:
+            t = self._ble_reconnect_task
+            if t is not None:
+                self._ble_reconnect_task = None
+                try: t.cancel()
+                except Exception: pass
+        except Exception:
+            pass
+        # Cancel continuous-silence task if it was running.
+        try:
+            t = self._silence_loop_task
+            if t is not None:
+                self._silence_loop_task = None
+                t.cancel()
+        except Exception:
+            pass
 
         async def _do():
             try:
@@ -583,6 +1130,53 @@ class OsaRuntime:
         return {'ok': True}
 
     # ────────────────────────────────────────────── Controller / sessions
+
+    def set_experiment_mode(self, mode: str) -> dict:
+        """Switch between full Block A and simple posture-only ('S') mode.
+
+        Side effects:
+          * Auto-applies a controller-config preset (the user can still
+            tweak afterwards; this just gives sane defaults when entering
+            the mode for the first time).
+          * In 'S' mode, stops the YAMNet snore detector and closes the
+            mic input stream so the experiment really only uses the chest
+            band + earphones. Switching back to 'A' restarts it.
+          * Tags subsequent sessions with `meta.mode = mode` so analysis
+            scripts can group A-night vs S-night trials.
+
+        Refusing to switch while a session is active — settings would
+        ambiguous in the recorded `meta.json`. Caller should stop the
+        session first.
+        """
+        mode = (mode or '').strip().upper()
+        if mode not in EXPERIMENT_MODES:
+            return {'ok': False, 'err': f'unknown mode: {mode!r}'}
+        if self.recorder is not None:
+            return {'ok': False,
+                    'err': '会话进行中, 请先「结束会话」再切换实验模式'}
+        if mode == self.experiment_mode:
+            return {'ok': True, 'mode': mode, 'unchanged': True}
+
+        prev = self.experiment_mode
+        self.experiment_mode = mode
+
+        preset = _MODE_DEFAULTS.get(mode, {})
+        self._controller_cfg_values.update(preset)
+
+        try:
+            if mode == 'S':
+                self.snore.stop()
+            else:
+                if self.snore._stream is None:
+                    self.snore.start()
+        except Exception as e:
+            self._push_event(f"切换 {prev}→{mode} 时音频检测器异常: {e}")
+
+        self._push_event(
+            f">> 实验模式 {prev} → {mode} "
+            f"({'仅姿态' if mode == 'S' else '仰卧+鼾声'})")
+        return {'ok': True, 'mode': mode,
+                'controller_config': dict(self._controller_cfg_values)}
 
     def set_controller_config(self, patch: dict) -> dict:
         v = self._controller_cfg_values
@@ -600,6 +1194,26 @@ class OsaRuntime:
         for k in ('active_window_start', 'active_window_end'):
             if k in patch:
                 v[k] = str(patch[k] or '').strip()
+        if 'strategy_pool' in patch:
+            raw = patch['strategy_pool']
+            if isinstance(raw, str):
+                raw = [raw]
+            picks = []
+            for s in (raw or []):
+                key = str(s).strip().upper()
+                if key in STRATEGY_REGISTRY and key not in picks:
+                    picks.append(key)
+            if not picks:
+                return {'ok': False,
+                        'err': 'strategy_pool 至少需要 1 个有效策略'}
+            v['strategy_pool'] = picks
+        if 'strategy_rotation_min' in patch:
+            try:
+                m = float(patch['strategy_rotation_min'])
+            except (TypeError, ValueError):
+                return {'ok': False,
+                        'err': 'strategy_rotation_min 必须是数字 (分钟)'}
+            v['strategy_rotation_min'] = max(0.0, m)
         if self.controller is not None:
             self.controller.cfg = self._build_cfg()
         if self.posture is not None:
@@ -608,6 +1222,8 @@ class OsaRuntime:
 
     def _build_cfg(self) -> ControllerConfig:
         v = self._controller_cfg_values
+        pool = v.get('strategy_pool') or ['P1', 'P2', 'P3']
+        rot_min = float(v.get('strategy_rotation_min', 0.0) or 0.0)
         return ControllerConfig(
             trigger_postures=('supine',),
             require_snoring=v['require_snoring'],
@@ -616,7 +1232,8 @@ class OsaRuntime:
             retry_reset_idle_s=v.get('retry_reset_idle_s', 30.0),
             snoring_recent_s=v['snoring_recent_s'],
             confirm_snore_bouts=int(v.get('confirm_snore_bouts', 1)),
-            strategy_pool=('P1', 'P2', 'P3'),
+            strategy_pool=tuple(pool),
+            strategy_rotation_s=max(0.0, rot_min) * 60.0,
             direction_policy='opposite',
             level_db=v['level_db'],
             response_window_s=v['response_window_s'],
@@ -737,14 +1354,17 @@ class OsaRuntime:
     def session_start(self, tag='', subject='', note='') -> dict:
         if self.recorder is not None:
             return {'ok': False, 'err': 'session already running'}
-        sid = new_session_id(tag.strip())
+        sid = new_session_id(tag.strip() or
+                             f"mode{self.experiment_mode}")
+        protocol = ('block_a_pilot' if self.experiment_mode == 'A'
+                    else 'posture_only_pilot')
         meta = SessionMeta(
             session_id=sid,
             started_at=datetime.now().isoformat(timespec='seconds'),
             subject_id=subject.strip(),
             note=note.strip(),
-            protocol='block_a_pilot',
-            mode='A',
+            protocol=protocol,
+            mode=self.experiment_mode,
             config=asdict(self._build_cfg()),
         )
         self.recorder = SessionRecorder(self.bus, meta)
@@ -753,6 +1373,10 @@ class OsaRuntime:
         self.controller = ClosedLoopController(
             self.bus, self.audio_sink, self._build_cfg(),
             snoring_provider=self.snore.is_snoring)
+        # Anchor strategy rotation to this session's start. Without this
+        # call the controller would still rotate, but starting from
+        # whenever the OsaRuntime process happened to launch.
+        self.controller.set_session_epoch(self.session_start_t)
         self.bus.emit('session.marker', {'kind': 'start', 'session': sid},
                       src='web')
         self._live['events'] = []
@@ -859,10 +1483,13 @@ class OsaRuntime:
                 base = f"{ts_str}_{block}_{strategy}_{direction or 'center'}"
 
                 span = mic_before_s + mic_after_s
-                try:
-                    wav = self.snore.snapshot(span + 0.2)
-                except Exception:
+                if self.experiment_mode == 'S':
                     wav = np.zeros(0, dtype=np.float32)
+                else:
+                    try:
+                        wav = self.snore.snapshot(span + 0.2)
+                    except Exception:
+                        wav = np.zeros(0, dtype=np.float32)
                 if wav.size > 0:
                     sf.write(str(ev_dir / f"{base}_mic.wav"),
                              wav, self.snore.sr)

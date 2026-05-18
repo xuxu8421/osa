@@ -10,6 +10,23 @@ body {
     Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* Avoid 16px-iOS auto-zoom on input focus */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Mobile: bigger touch targets, larger system font sizes */
+@media (max-width: 640px) {
+  .btn { min-height: 44px; padding: 0.6rem 1rem; }
+  .tab-btn { min-height: 44px; padding: 0.7rem 1rem; }
+  .badge { padding: 0.45rem 0.85rem; font-size: 0.875rem; }
+  input[type="text"], input[type="number"], select, textarea {
+    font-size: 16px !important;  /* iOS Safari won't zoom-in on focus */
+    min-height: 44px;
+  }
+  /* Tighter card padding on small screens to make better use of width */
+  .card { border-radius: 12px; }
+  /* Hide the 1200px max-width container's huge gutters */
+  .max-w-\[1200px\] { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
 }
 
 /* Card */
@@ -23,6 +40,62 @@ body {
 .card h3 {
   font-weight: 600;
   letter-spacing: 0.01em;
+}
+
+/* Section accents — left-side color bar groups cards into "实时监控 / 实验配置 / 日志"
+   Three categories instead of N independent flat cards = much less visual noise. */
+.card.mon { border-left: 3px solid rgba(56, 189, 248, 0.55); }   /* sky-400 — 监控 */
+.card.cfg { border-left: 3px solid rgba(168, 85, 247, 0.55); }   /* purple-400 — 配置 */
+.card.log { border-left: 3px solid rgba(148, 163, 184, 0.4); }   /* slate-400 — 日志 */
+
+/* Section banner — clickable header that toggles its group of cards.
+   Large enough to feel like a primary navigation element on phone too. */
+.section-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.25rem 0 0.75rem;
+  padding: 0.7rem 0.95rem;
+  font-size: 1.0625rem;        /* ~17 px, comfortable on phone */
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #cbd5e1;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.section-bar:hover { background: rgba(30, 41, 59, 0.75); }
+.section-bar:active { transform: translateY(1px); }
+.section-bar::before {
+  content: '';
+  width: 4px; height: 1.4rem; border-radius: 3px;
+  background: rgba(148,163,184,0.5);
+}
+.section-bar.mon { color: #7dd3fc; }
+.section-bar.mon::before { background: rgba(56, 189, 248, 0.85); box-shadow: 0 0 8px rgba(56,189,248,0.5); }
+.section-bar.cfg { color: #c4b5fd; }
+.section-bar.cfg::before { background: rgba(168, 85, 247, 0.85); box-shadow: 0 0 8px rgba(168,85,247,0.5); }
+.section-bar.log { color: #cbd5e1; }
+.section-bar.log::before { background: rgba(148, 163, 184, 0.7); }
+.section-bar .chevron {
+  font-size: 0.85rem;
+  color: #94a3b8;
+  transition: transform 180ms ease;
+}
+.section-bar .chevron.open { transform: rotate(90deg); }
+.section-bar .count {
+  margin-left: auto;
+  font-weight: 400;
+  letter-spacing: normal;
+  font-size: 0.8125rem;
+  color: #94a3b8;
+}
+@media (max-width: 640px) {
+  .section-bar { padding: 0.85rem 1rem; font-size: 1.125rem; }
+  .section-bar::before { height: 1.5rem; }
 }
 
 /* Pill badges */

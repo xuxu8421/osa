@@ -21,6 +21,7 @@ Endpoints:
   POST /api/ble/chest/connect     — connect
   POST /api/ble/chest/disconnect  — disconnect
   GET/POST /api/audio/devices     — list / set audio input/output devices
+  POST /api/experiment/mode       — switch between 'A' (Block A) and 'S' (仅姿态)
   POST /api/controller/config     — update thresholds
   POST /api/snore/config          — update YAMNet threshold
   POST /api/session/start         — start recording session
@@ -39,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
@@ -115,6 +116,10 @@ class PresetDelReq(BaseModel):
     name: str
 
 
+class ExperimentModeReq(BaseModel):
+    mode: str  # 'A' (Block A) | 'S' (posture-only)
+
+
 class CtrlCfgReq(BaseModel):
     trigger_hold_s: Optional[float] = None
     retry_trigger_hold_s: Optional[float] = None
@@ -129,6 +134,8 @@ class CtrlCfgReq(BaseModel):
     confirm_snore_bouts: Optional[int] = None
     active_window_start: Optional[str] = None
     active_window_end: Optional[str] = None
+    strategy_pool: Optional[List[str]] = None
+    strategy_rotation_min: Optional[float] = None
 
 
 class SnoreCfgReq(BaseModel):
@@ -237,7 +244,58 @@ def api_chest_disconnect():
     return get_runtime().chest_disconnect()
 
 
+class ChestSilenceReq(BaseModel):
+    keep_spo2: bool = True
+    switches: Optional[int] = None  # raw override of byte 9
+    b10: int = 0
+    b11: int = 0
+    b12: int = 0
+
+
+@app.post('/api/ble/chest/silence')
+def api_chest_silence(req: ChestSilenceReq):
+    return get_runtime().chest_silence(
+        keep_spo2=req.keep_spo2, switches=req.switches,
+        b10=req.b10, b11=req.b11, b12=req.b12)
+
+
+class ChestSilenceLoopReq(BaseModel):
+    on: bool = True
+    period_s: float = 1.0
+
+
+@app.post('/api/ble/chest/silence_loop')
+def api_chest_silence_loop(req: ChestSilenceLoopReq):
+    return get_runtime().chest_silence_loop_set(
+        on=req.on, period_s=req.period_s)
+
+
+class ChestUnbindReq(BaseModel):
+    peripheral_type: int = 0x01  # 0x01 = SpO2 (PC-68B), 0x00 = thermometer
+
+
+@app.post('/api/ble/chest/unbind_peripheral')
+def api_chest_unbind_peripheral(req: ChestUnbindReq):
+    return get_runtime().chest_unbind_peripheral(
+        peripheral_type=req.peripheral_type)
+
+
+@app.post('/api/ble/chest/unbind_all')
+def api_chest_unbind_all():
+    return get_runtime().chest_unbind_all_peripherals()
+
+
+@app.post('/api/ble/chest/resync_rtc')
+def api_chest_resync_rtc():
+    return get_runtime().chest_resync_rtc()
+
+
 # ── Controller / snore config ─────────────────────────────────────────────
+
+@app.post('/api/experiment/mode')
+def api_experiment_mode(req: ExperimentModeReq):
+    return get_runtime().set_experiment_mode(req.mode)
+
 
 @app.post('/api/controller/config')
 def api_ctrl_cfg(req: CtrlCfgReq):

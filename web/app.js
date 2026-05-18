@@ -19,6 +19,16 @@ function postureZh(p) {
     upright: '直立/坐', unknown: '未知',
   })[p] || (p || '—');
 }
+function controllerStateZh(s) {
+  return ({
+    idle: '等待条件',
+    armed: '仰卧计时中',
+    triggered: '已触发',
+    playing: '正在播放',
+    observe: '观察翻身',
+    cooldown: '冷却中',
+  })[s] || (s || '—');
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -53,11 +63,19 @@ const App = {
       audioDevs: { inputs: [], outputs: [], loading: false,
                    inputSel: '', outputSel: '' },
       showChestPanel: true,
+      showChestDiag: false,
+      showEventTimeline: false,
+      // Collapsible sections in the experiment tab.
+      // Defaults: monitoring + config open (the live data view), log
+      // closed (rarely needed during a run).
+      sectionOpen: { mon: true, cfg: true, log: false },
+      wakeLockSentinel: null,
       // experiment
       sessionForm: { tag: '', subject: '', note: '' },
       showCtrlCfg: false,
       showSnoreCfg: false,
       yamnetThresh: 0.3,
+      modeSwitchBusy: false,
       // replay
       historyList: [],
       replaySelectedId: '',
@@ -162,24 +180,70 @@ const App = {
         return { label, kind, text };
       };
       if (!s) return [];
-      const spo2Val = s.chestband?.vitals?.spo2;
-      const spo2Stale = s.chestband?.spo2_stale;
-      let spo2Kind = '', spo2Extra = 'SpO2  —';
-      if (spo2Val != null && !spo2Stale) {
-        spo2Kind = 'ok'; spo2Extra = `SpO2  ${spo2Val}%`;
-      } else if (s.chestband.state === 'connected') {
-        spo2Kind = 'warn'; spo2Extra = 'SpO2  失效 (查 PC-68B)';
-      }
-      return [
+      const mode = s.experiment?.mode || 'A';
+      const isSimple = mode === 'S';
+      const out = [
         mk('胸带', s.chestband.state, s.chestband.pkt ? '#' + s.chestband.pkt : ''),
-        { label: '', kind: spo2Kind, text: spo2Extra },
-        mk('麦克风', s.snore.status === 'listening' ? 'listening' : s.snore.status,
-           (s.audio?.input_device != null ? `#${s.audio.input_device}` : 'OS 默认') +
-           (s.snore.snoring ? ' · 打鼾中' : '')),
-        { label: '输出', kind: '',
-          text: '输出  ' + (s.audio?.output_device != null
-                            ? '#' + s.audio.output_device : 'OS 默认') },
       ];
+      if (!isSimple) {
+        const spo2Val = s.chestband?.vitals?.spo2;
+        const spo2Stale = s.chestband?.spo2_stale;
+        let spo2Kind = '', spo2Extra = 'SpO2  —';
+        if (spo2Val != null && !spo2Stale) {
+          spo2Kind = 'ok'; spo2Extra = `SpO2  ${spo2Val}%`;
+        } else if (s.chestband.state === 'connected') {
+          spo2Kind = 'warn'; spo2Extra = 'SpO2  失效 (查 PC-68B)';
+        }
+        out.push({ label: '', kind: spo2Kind, text: spo2Extra });
+        out.push(mk('麦克风',
+          s.snore.status === 'listening' ? 'listening' : s.snore.status,
+          (s.audio?.input_device != null ? `#${s.audio.input_device}` : 'OS 默认') +
+          (s.snore.snoring ? ' · 打鼾中' : '')));
+      }
+      out.push({ label: '输出', kind: '',
+        text: '输出  ' + (s.audio?.output_device != null
+                          ? '#' + s.audio.output_device : 'OS 默认') });
+      return out;
+    },
+    isSimpleMode() {
+      return (this.snap?.experiment?.mode || 'A') === 'S';
+    },
+    experimentMode() {
+      return this.snap?.experiment?.mode || 'A';
+    },
+    experimentModeLabel() {
+      return this.snap?.experiment?.mode_label || '—';
+    },
+    strategyPool() {
+      return this.snap?.controller?.config?.strategy_pool || [];
+    },
+    strategyRotationMin() {
+      return Number(this.snap?.controller?.config?.strategy_rotation_min ?? 0);
+    },
+    rotationActive() {
+      return this.strategyRotationMin > 0 && this.strategyPool.length >= 2;
+    },
+    rotationState() {
+      return this.snap?.controller?.rotation || null;
+    },
+    upcomingInterventionLabel() {
+      const pool = this.strategyPool || [];
+      if (this.rotationActive) {
+        if (this.rotationState?.current) return this.rotationState.current;
+        return '轮播: ' + pool.join(' → ');
+      }
+      if (pool.length === 1) return pool[0];
+      if (pool.length > 1) return '随机抽选: ' + pool.join(' / ');
+      return '—';
+    },
+    strategyPoolLabel() {
+      const p = this.strategyPool;
+      if (!p.length) return '—';
+      if (p.length === 1) return p[0] + ' · 单一固定';
+      if (this.rotationActive) {
+        return p.join(' → ') + ` · 每 ${fmt(this.strategyRotationMin, 0)} 分钟一轮`;
+      }
+      return p.join(' / ') + ' · 随机抽选';
     },
     posturePretty() {
       if (!this.snap) return '—';
@@ -257,6 +321,7 @@ const App = {
       await this.reloadAudioDevices();
     } catch (e) { console.error(e); }
     this.connectWS();
+    document.addEventListener('visibilitychange', this._onVisibility);
     this.$nextTick(() => {
       this.buildPreviewChart();
       this.buildChestChart();
@@ -266,6 +331,8 @@ const App = {
   beforeUnmount() {
     if (this.ws) try { this.ws.close(); } catch {}
     if (this._audioPoll) clearInterval(this._audioPoll);
+    document.removeEventListener('visibilitychange', this._onVisibility);
+    this.releaseWakeLock();
   },
   watch: {
     strat() { this.resetParamsFromStrategy(); this.refreshPreview(); },
@@ -279,15 +346,26 @@ const App = {
     },
   },
   methods: {
+    controllerStateZh,
     connectWS() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const url = `${proto}://${location.host}/ws`;
       this.wsStatus = 'connecting';
       const ws = new WebSocket(url);
       this.ws = ws;
-      ws.onopen  = () => { this.wsStatus = 'open'; };
-      ws.onclose = () => { this.wsStatus = 'closed';
-                           setTimeout(() => this.connectWS(), 1200); };
+      ws.onopen  = () => {
+        this.wsStatus = 'open';
+        this._wsRetry = 0;  // reset backoff on successful connect
+      };
+      ws.onclose = () => {
+        this.wsStatus = 'closed';
+        // Exponential backoff: 1s, 2s, 4s, 8s, 15s (capped) — keeps us
+        // gentle when the server is restarting but recovers fast normally.
+        const n = (this._wsRetry || 0) + 1;
+        this._wsRetry = n;
+        const delay = Math.min(15000, 1000 * Math.pow(2, Math.min(n - 1, 4)));
+        setTimeout(() => this.connectWS(), delay);
+      };
       ws.onerror = () => { this.wsStatus = 'error'; };
       ws.onmessage = (ev) => {
         try {
@@ -402,6 +480,61 @@ const App = {
     async chestDisconnectGo() {
       await api('/api/ble/chest/disconnect', { method: 'POST' });
     },
+    async chestSilenceSend(body, label) {
+      // body: { keep_spo2?: bool, switches?: int }
+      // Always shows result so we know whether the frame got through
+      // even when the chest band's beep didn't actually stop.
+      try {
+        const r = await api('/api/ble/chest/silence', { method: 'POST',
+          body });
+        const lines = [
+          `${label || '0x0B 告警开关帧'} → 写入 ${r.ok ? '成功' : '失败'}`,
+          `switches = ${r.switches_hex || ('0x' + (r.switches ?? 0).toString(16).padStart(2, '0').toUpperCase())}`,
+          `DID = ${r.did_hex || '—'}`,
+          `frame = ${r.frame_hex || '—'}`,
+        ];
+        if (r.err) lines.push('错误: ' + r.err);
+        if (r.ok) {
+          lines.push('');
+          lines.push('如果蜂鸣声没停, 说明这版固件不响应这组开关位 ─');
+          lines.push('换个 switches 值再试 (按钮旁边「试其他位」).');
+        }
+        alert(lines.join('\n'));
+      } catch (e) {
+        alert('请求失败: ' + e);
+      }
+    },
+    chestSilenceGo() {
+      // Send 0x0B silence frame (bit 6 = keep BT pulse-oximeter relay).
+      // Empirically ineffective on the HSRG firmware variant — kept here
+      // as a fallback in the diagnostics panel; the working command is
+      // `chestResyncRTC`.
+      this.chestSilenceSend({ keep_spo2: true }, '0x0B 状态控制帧');
+    },
+    async chestUnbindAll() {
+      try {
+        const r = await api('/api/ble/chest/unbind_all',
+          { method: 'POST', body: {} });
+        const lines = [`解绑全部外设 → ${r.ok ? '部分/全部成功' : '失败'}`];
+        for (const x of (r.results || [])) {
+          lines.push(` · ${x.label} (type=0x${x.type.toString(16).padStart(2,'0')}) ${x.ok ? 'OK' : '失败'}`);
+        }
+        lines.push('');
+        lines.push('观察「告警标志位」横幅: bit 2-5 应该会清零.');
+        lines.push('如果 bit 0 (心电脱落) 还在 → 是电极阻抗问题, 抹点导电凝胶/盐水.');
+        alert(lines.join('\n'));
+      } catch (e) { alert('请求失败: ' + e); }
+    },
+    async chestResyncRTC() {
+      try {
+        const r = await api('/api/ble/chest/resync_rtc',
+          { method: 'POST', body: {} });
+        alert(`重发 RTC 同步 → ${r.ok ? '成功' : '失败'}\n`
+          + `frame = ${r.frame_hex || '—'}\n`
+          + (r.err ? '错误: ' + r.err : '')
+          + '\n下一秒看 device_status, bit 6 应该清零.');
+      } catch (e) { alert('请求失败: ' + e); }
+    },
     async testTone(d) {
       const r = await api('/api/play', { method: 'POST', body: {
         strategy: 'P1', direction: d, params: {}, repeats: 1 }});
@@ -450,17 +583,100 @@ const App = {
         subject,
         note: this.sessionForm.note || '',
       }});
-      if (!r.ok) alert('开始失败: ' + (r.err || ''));
+      if (!r.ok) {
+        alert('开始失败: ' + (r.err || ''));
+        return;
+      }
+      this.acquireWakeLock();
     },
     async sessionStop() {
       await api('/api/session/stop', { method: 'POST' });
+      this.releaseWakeLock();
+    },
+    async acquireWakeLock() {
+      // Best-effort screen wake lock so the phone / laptop doesn't sleep
+      // while a session is running. Browser support varies, so failures
+      // are silently ignored — the OS-level safety net (e.g. caffeinate
+      // on macOS) handles the rest.
+      if (!('wakeLock' in navigator)) return;
+      try {
+        this.wakeLockSentinel = await navigator.wakeLock.request('screen');
+        this.wakeLockSentinel.addEventListener('release', () => {
+          // OS or another tab released our lock. If a session is still
+          // running, try to re-acquire on next visibility event.
+          this.wakeLockSentinel = null;
+        });
+      } catch (e) {
+        console.warn('wakeLock 请求失败:', e);
+      }
+    },
+    releaseWakeLock() {
+      if (this.wakeLockSentinel) {
+        try { this.wakeLockSentinel.release(); } catch {}
+        this.wakeLockSentinel = null;
+      }
+    },
+    _onVisibility() {
+      // When the page becomes visible again (e.g. user unlocked phone),
+      // re-acquire the wake lock if a session is still running. Browsers
+      // automatically release wake locks when the page goes to background.
+      if (document.visibilityState === 'visible'
+          && this.snap?.session?.active
+          && !this.wakeLockSentinel) {
+        this.acquireWakeLock();
+      }
     },
     async manualTrigger() { await api('/api/trigger', { method: 'POST' }); },
+    async switchExperimentMode(target) {
+      if (this.modeSwitchBusy) return;
+      if (this.snap?.session?.active) {
+        alert('会话进行中, 请先「结束会话」再切换实验模式');
+        return;
+      }
+      if (target === this.experimentMode) return;
+      const tip = target === 'S'
+        ? '切到「S · 仅姿态」模式? 将停止麦克风采集, 触发条件简化为仅仰卧'
+        : '切到「A · 仰卧+鼾声 (Block A)」模式? 将重启麦克风+YAMNet';
+      if (!confirm(tip)) return;
+      this.modeSwitchBusy = true;
+      try {
+        const r = await api('/api/experiment/mode', { method: 'POST',
+          body: { mode: target }});
+        if (!r.ok) alert('切换失败: ' + (r.err || '未知'));
+      } finally { this.modeSwitchBusy = false; }
+    },
     async openSessionsDir() {
       await api('/api/history/open', { method: 'POST' });
     },
     async applyCtrlCfg(patch) {
       await api('/api/controller/config', { method: 'POST', body: patch });
+    },
+    async setSingleStrategy(key) {
+      const r = await api('/api/controller/config', { method: 'POST',
+        body: { strategy_pool: [key], strategy_rotation_min: 0 }});
+      if (!r.ok) alert('切换策略失败: ' + (r.err || ''));
+    },
+    async setRotationMinutes(min) {
+      const v = Math.max(0, Number(min) || 0);
+      const r = await api('/api/controller/config', { method: 'POST',
+        body: { strategy_rotation_min: v }});
+      if (!r.ok) alert('设置轮播间隔失败: ' + (r.err || ''));
+    },
+    async togglePoolStrategy(key) {
+      const cur = this.strategyPool.slice();
+      const idx = cur.indexOf(key);
+      if (idx >= 0) {
+        if (cur.length <= 1) {
+          alert('至少需要保留 1 个策略');
+          return;
+        }
+        cur.splice(idx, 1);
+      } else {
+        cur.push(key);
+      }
+      const r = await api('/api/controller/config', { method: 'POST',
+        body: { strategy_pool: cur }});
+      if (!r.ok) alert('修改策略池失败: ' + (r.err || ''));
     },
     async applySnoreCfg(patch) {
       await api('/api/snore/config', { method: 'POST', body: patch });
@@ -610,7 +826,8 @@ const App = {
   <header class="sticky top-0 z-30 backdrop-blur
                  bg-ink-900/80 border-b border-slate-700/40">
     <div class="max-w-[1200px] mx-auto px-4 py-3">
-      <div class="flex items-center gap-3 flex-wrap">
+      <!-- Row 1: logo + WS status (small screen: condensed) -->
+      <div class="flex items-center gap-3">
         <div class="flex items-center gap-2">
           <div class="w-8 h-8 rounded-xl bg-gradient-to-br
                       from-sky-400 to-indigo-500 grid place-items-center
@@ -618,12 +835,20 @@ const App = {
             <span class="text-xs font-bold text-white">OSA</span>
           </div>
           <div class="leading-tight">
-            <div class="font-semibold">打鼾干预实验工作台</div>
-            <div class="text-xs dim">WebSocket · {{ wsStatus }}</div>
+            <div class="font-semibold text-sm sm:text-base">打鼾干预实验工作台</div>
+            <div class="text-[10px] sm:text-xs dim flex items-center gap-1.5">
+              <span class="inline-block w-1.5 h-1.5 rounded-full"
+                    :class="wsStatus === 'open' ? 'bg-emerald-400'
+                          : wsStatus === 'connecting' ? 'bg-amber-400 animate-pulse'
+                          : 'bg-rose-500'"></span>
+              <span class="hidden sm:inline">WebSocket · {{ wsStatus }}</span>
+              <span class="sm:hidden">{{ wsStatus }}</span>
+            </div>
           </div>
         </div>
         <div class="flex-1"></div>
-        <div class="flex gap-2 flex-wrap">
+        <!-- Status badges: visible on tablet+, hidden on phone (详情在主体卡片) -->
+        <div class="hidden md:flex gap-2 flex-wrap">
           <span v-for="b in badges" :key="b.label"
                 :class="['badge', b.kind]">
             <span class="dot"></span>{{ b.text }}
@@ -631,39 +856,55 @@ const App = {
         </div>
       </div>
 
-      <div class="mt-3 flex items-center gap-2 flex-wrap">
-        <nav class="flex gap-1 p-1 rounded-xl bg-slate-800/40 border border-slate-700/40">
-          <button class="tab-btn" :class="{active: tab==='experiment'}"
-                  @click="tab='experiment'">实时实验</button>
-          <button class="tab-btn" :class="{active: tab==='devices'}"
-                  @click="tab='devices'">设备连接</button>
-          <button class="tab-btn" :class="{active: tab==='design'}"
-                  @click="tab='design'">声音设计</button>
-          <button class="tab-btn" :class="{active: tab==='replay'}"
-                  @click="tab='replay'">回放 / 审核</button>
-        </nav>
-        <div class="flex-1"></div>
-        <div class="flex items-center gap-2 flex-wrap">
-          <!-- Inactive: a single subject-id input + 开始会话 + 手动触发. -->
-          <template v-if="!snap || !snap.session.active">
-            <input type="text" v-model="sessionForm.subject"
-                   placeholder="被试 ID / 姓名" class="w-[200px]">
-            <button class="btn success" @click="sessionStart">开始会话</button>
-          </template>
-          <!-- Active: show session id + duration, 结束 + 手动触发. -->
-          <template v-else>
-            <div class="text-sm">
-              <span class="dim">会话</span>
-              <span class="font-mono ml-1">{{ snap.session.id }}</span>
-              <span class="text-emerald-300 ml-2">·
-                {{ secToClock(snap.session.duration_s) }}</span>
-              <span v-if="snap.session.subject" class="dim ml-2">·
-                {{ snap.session.subject }}</span>
-            </div>
-            <button class="btn danger" @click="sessionStop">结束会话</button>
-          </template>
-          <button class="btn warn" @click="manualTrigger">手动触发</button>
+      <!-- Row 2: tab nav + mode switch (horizontal scroll on small screen) -->
+      <div class="mt-3 -mx-4 px-4 overflow-x-auto">
+        <div class="flex items-center gap-2 min-w-max">
+          <nav class="flex gap-1 p-1 rounded-xl bg-slate-800/40 border border-slate-700/40">
+            <button class="tab-btn" :class="{active: tab==='experiment'}"
+                    @click="tab='experiment'">实时实验</button>
+            <button class="tab-btn" :class="{active: tab==='devices'}"
+                    @click="tab='devices'">设备</button>
+            <button class="tab-btn" :class="{active: tab==='replay'}"
+                    @click="tab='replay'">回放</button>
+            <button class="tab-btn text-xs"
+                    :class="{active: tab==='design'}"
+                    @click="tab='design'"
+                    title="声音策略调试 (开发用, 实验时可忽略)">⚙</button>
+          </nav>
+          <div class="flex items-center gap-1 p-1 rounded-xl
+                      bg-slate-800/40 border border-slate-700/40"
+               v-if="snap" :title="'实验模式 · ' + experimentModeLabel">
+            <button class="tab-btn" :class="{active: experimentMode==='A'}"
+                    :disabled="modeSwitchBusy || (snap?.session?.active && experimentMode!=='A')"
+                    @click="switchExperimentMode('A')">A · 仰卧+鼾声</button>
+            <button class="tab-btn" :class="{active: experimentMode==='S'}"
+                    :disabled="modeSwitchBusy || (snap?.session?.active && experimentMode!=='S')"
+                    @click="switchExperimentMode('S')">S · 仅姿态</button>
+          </div>
         </div>
+      </div>
+
+      <!-- Row 3: session controls (full-width input on phone) -->
+      <div class="mt-3 flex items-center gap-2 flex-wrap">
+        <template v-if="!snap || !snap.session.active">
+          <input type="text" v-model="sessionForm.subject"
+                 placeholder="被试 ID / 姓名"
+                 class="flex-1 min-w-[140px] sm:flex-initial sm:w-[200px]">
+          <button class="btn success" @click="sessionStart">开始会话</button>
+        </template>
+        <template v-else>
+          <div class="text-sm flex-1 min-w-0">
+            <span class="dim">会话</span>
+            <span class="font-mono ml-1 truncate inline-block max-w-[160px] align-bottom"
+                  :title="snap.session.id">{{ snap.session.id }}</span>
+            <span class="text-emerald-300 ml-2">·
+              {{ secToClock(snap.session.duration_s) }}</span>
+            <span v-if="snap.session.subject" class="dim ml-2">·
+              {{ snap.session.subject }}</span>
+          </div>
+          <button class="btn danger" @click="sessionStop">结束会话</button>
+        </template>
+        <button class="btn warn" @click="manualTrigger">手动触发</button>
       </div>
 
       <div v-if="snap" class="mt-3 rounded-xl border px-4 py-3 transition"
@@ -701,34 +942,77 @@ const App = {
 
     <!-- ====== tab: 实时实验 ====== -->
     <section v-show="tab==='experiment'" class="space-y-6">
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div class="card p-4 text-center"
-             :class="{ 'opacity-40': snap?.chestband?.spo2_stale }">
+      <div v-if="isSimpleMode"
+           class="rounded-xl border border-amber-500/40 bg-amber-500/10
+                  px-4 py-3 text-sm">
+        <div class="font-semibold text-amber-200">
+          S 模式 · 仅姿态干预 (简化版)
+        </div>
+        <div class="text-amber-100/80 mt-1">
+          硬件: 仅胸带 + 耳机. 触发条件: 仰卧持续
+          <span class="kbd">{{ fmt(snap?.controller?.config?.trigger_hold_s, 0) }} s</span>
+          → 播放
+          <span v-if="rotationActive" class="kbd">
+            轮播 {{ strategyPool.join('→') }} (每 {{ fmt(strategyRotationMin, 0) }} 分钟)
+          </span>
+          <span v-else class="kbd">{{ strategyPool.join(' / ') || '—' }}</span>
+          → 观察
+          <span class="kbd">{{ fmt(snap?.controller?.config?.response_window_s, 0) }} s</span>
+          内是否翻身. 不需要 PC-68B 血氧仪、不需要麦克风/YAMNet.
+        </div>
+      </div>
+
+      <!-- ═══ 📡 实时监控 ═══ -->
+      <div class="section-bar mon" @click="sectionOpen.mon = !sectionOpen.mon">
+        <span class="chevron" :class="{ open: sectionOpen.mon }">▶</span>
+        📡 实时监控
+        <span class="count">
+          <span v-if="snap?.posture?.cls && snap.posture.cls !== 'unknown'">
+            {{ posturePretty }}</span>
+          <span v-if="!isSimpleMode && snap?.chestband?.vitals?.spo2">
+            · SpO2 {{ snap.chestband.vitals.spo2 }}%</span>
+          <span v-if="!isSimpleMode && snap?.chestband?.chest_rr">
+            · RR {{ fmt(snap.chestband.chest_rr, 0) }}</span>
+        </span>
+      </div>
+
+      <div v-show="sectionOpen.mon" class="space-y-6">
+
+      <div :class="isSimpleMode
+                  ? 'grid grid-cols-1 md:grid-cols-2 gap-4'
+                  : 'grid grid-cols-2 md:grid-cols-4 gap-3'">
+        <div class="card mon p-4 text-center"
+             v-if="!isSimpleMode"
+             :class="{ 'opacity-40': isSimpleMode || snap?.chestband?.spo2_stale }">
           <div class="text-xs dim">SpO2</div>
           <div class="mt-1 text-3xl font-semibold font-mono">
-            <span v-if="snap?.chestband?.vitals?.spo2">
+            <span v-if="!isSimpleMode && snap?.chestband?.vitals?.spo2">
               {{ snap.chestband.vitals.spo2 }}<span class="text-base dim">%</span>
             </span>
             <span v-else class="dim">—</span>
           </div>
           <div class="mt-1 text-[10px] dim">
-            {{ snap?.chestband?.spo2_stale
-                ? '失效 (查 PC-68B)'
-                : '来源: PC-68B 转发' }}
+            <span v-if="isSimpleMode">S 模式 · 未启用</span>
+            <span v-else-if="snap?.chestband?.spo2_stale">失效 (查 PC-68B)</span>
+            <span v-else>来源: PC-68B 转发</span>
           </div>
         </div>
-        <div class="card p-4 text-center"
-             :class="{ 'opacity-40': snap?.chestband?.pulse_stale }">
+        <div class="card mon p-4 text-center"
+             v-if="!isSimpleMode"
+             :class="{ 'opacity-40': isSimpleMode || snap?.chestband?.pulse_stale }">
           <div class="text-xs dim">脉率</div>
           <div class="mt-1 text-3xl font-semibold font-mono">
-            <span v-if="snap?.chestband?.vitals?.pulse">
+            <span v-if="!isSimpleMode && snap?.chestband?.vitals?.pulse">
               {{ snap.chestband.vitals.pulse }}<span class="text-base dim"> bpm</span>
             </span>
             <span v-else class="dim">—</span>
           </div>
-          <div class="mt-1 text-[10px] dim">PC-68B 脉搏波</div>
+          <div class="mt-1 text-[10px] dim">
+            <span v-if="isSimpleMode">S 模式 · 未启用</span>
+            <span v-else>PC-68B 脉搏波</span>
+          </div>
         </div>
-        <div class="card p-4 text-center">
+        <div class="card mon p-4 text-center" v-if="!isSimpleMode">
           <div class="text-xs dim">呼吸率</div>
           <div class="mt-1 text-3xl font-semibold font-mono">
             <span v-if="snap?.chestband?.chest_rr">
@@ -738,9 +1022,9 @@ const App = {
           </div>
           <div class="mt-1 text-[10px] dim">胸带 RIP 峰检测</div>
         </div>
-        <div class="card p-4 text-center">
+        <div class="card mon p-5 text-center">
           <div class="text-xs dim">姿态</div>
-          <div class="mt-1 text-2xl font-semibold">
+          <div :class="isSimpleMode ? 'mt-2 text-3xl font-semibold' : 'mt-1 text-2xl font-semibold'">
             <span v-if="snap?.posture?.cls && snap.posture.cls !== 'unknown'">
               {{ posturePretty }}</span>
             <span v-else class="dim">—</span>
@@ -749,67 +1033,41 @@ const App = {
             胸带 accel · debounce {{ fmt(snap?.controller?.config?.debounce_s, 1) }} s
           </div>
         </div>
-      </div>
-
-      <div class="card p-5">
-          <h3 class="text-sky-300 mb-1">当前触发条件 · 仰卧 + 检测到打鼾</h3>
-          <p class="text-xs dim">同时满足约
-            <span class="kbd">{{ fmt(snap?.controller?.config?.trigger_hold_s, 0) }} s</span>
-            才触发；取消「需要鼾声」即退化为只看姿态。</p>
-          <div class="mt-4 grid grid-cols-1 gap-3">
-            <div class="flex items-center gap-3">
-              <span class="dim w-28">姿态</span>
-              <span v-if="snap?.posture.cls==='supine'"
-                    class="badge ok"><span class="dot"></span>{{ posturePretty }} · 满足</span>
-              <span v-else-if="snap?.posture.cls==='unknown' || !snap"
-                    class="badge"><span class="dot"></span>{{ posturePretty }}</span>
-              <span v-else class="badge warn">
-                <span class="dot"></span>{{ posturePretty }}</span>
-            </div>
-            <div class="flex items-center gap-3">
-              <span class="dim w-28">鼾声通道</span>
-              <template v-if="!snap">
-                <span class="badge">待麦克风启动</span>
-              </template>
-              <template v-else-if="snap.snore.status==='listening' && snap.snore.snoring">
-                <span class="badge ok"><span class="dot"></span>检测到 · 满足</span>
-                <span class="text-xs dim font-mono">{{ snoreDetail }}</span>
-              </template>
-              <template v-else-if="snap.snore.status==='listening'">
-                <span class="badge">安静</span>
-                <span class="text-xs dim font-mono">{{ snoreDetail }}</span>
-              </template>
-              <template v-else-if="snap.snore.status==='loading'">
-                <span class="badge warn"><span class="dot"></span>YAMNet 加载中…</span>
-              </template>
-              <template v-else>
-                <span class="badge err">{{ snap.snore.error || '未启动' }}</span>
-              </template>
-            </div>
-            <div>
-              <div class="flex justify-between text-xs dim mb-1">
-                <span>已持续</span>
-                <span>{{ fmt((snap?.controller?.armed_duration || 0), 1) }} /
-                  {{ fmt(snap?.controller?.config?.trigger_hold_s, 1) }} s</span>
-              </div>
-              <div class="progress trigger"><div
-                :style="{width: (triggerArmedPct*100).toFixed(1) + '%'}"></div></div>
-            </div>
-            <div v-if="snap && !snap.session.active"
-                 class="text-amber-300 text-sm">
-              未开始会话 · 自动闭环不会触发 (上方「开始会话」)
-            </div>
-            <div v-else-if="snap" class="text-emerald-300 text-sm">
-              会话进行中 · 控制器状态
-              <span class="kbd">{{ snap.controller.state }}</span>
-              <span v-if="snap.controller.last_strategy" class="dim ml-2">
-                · 上次 {{ snap.controller.last_strategy }} / {{ snap.controller.last_direction }}
-              </span>
+        <div class="card mon p-5 text-center" v-if="isSimpleMode">
+          <div class="text-xs dim">干预声</div>
+          <div class="mt-2 text-2xl font-semibold">
+            {{ controllerStateZh(snap?.controller?.state) }}
+          </div>
+          <div class="mt-3 rounded-lg border border-sky-500/25 bg-sky-500/10 p-3">
+            <div class="text-xs dim">下一次触发将使用</div>
+            <div class="mt-1 text-lg font-semibold font-mono text-sky-200">
+              {{ upcomingInterventionLabel }}
             </div>
           </div>
+          <div class="mt-2 text-xs dim">
+            <span v-if="snap?.controller?.state === 'playing' || snap?.controller?.state === 'triggered'">
+              正在播放 {{ snap.controller.last_strategy || '—' }}
+              <span v-if="snap.controller.last_direction"> · {{ snap.controller.last_direction }}</span>
+            </span>
+            <span v-else-if="snap?.controller?.state === 'cooldown'">
+              剩余 {{ fmt(snap.controller.cooldown_left, 1) }} s
+            </span>
+            <span v-else-if="snap?.controller?.state === 'armed'">
+              {{ fmt(snap.controller.armed_duration, 1) }} /
+              {{ fmt(snap.controller.trigger_hold_s, 1) }} s
+            </span>
+            <span v-else>
+              最近 {{ snap?.controller?.last_strategy || '尚未播放' }}
+            </span>
+          </div>
+          <div v-if="snap?.controller?.state === 'armed'" class="mt-2">
+            <div class="progress trigger"><div
+              :style="{width: (triggerArmedPct*100).toFixed(1) + '%'}"></div></div>
+          </div>
         </div>
+      </div>
 
-      <div class="card p-5">
+      <div class="card p-5 mon" v-if="!isSimpleMode">
         <div class="flex items-center justify-between flex-wrap gap-2">
           <h3 class="text-sky-300">鼾声判决时间线  (近 90 秒)</h3>
           <div class="text-xs dim font-mono flex items-center gap-3 flex-wrap" v-if="snap">
@@ -878,7 +1136,7 @@ const App = {
         </div>
       </div>
 
-      <div class="card p-5">
+      <div class="card mon p-5" v-show="!isSimpleMode">
         <div class="flex items-center justify-between flex-wrap gap-2">
           <h3 class="text-sky-300">胸呼吸  (近 30 秒)</h3>
           <div class="text-xs dim" v-if="snap">
@@ -896,25 +1154,202 @@ const App = {
         </div>
       </div>
 
-      <div class="card p-5">
-        <button class="text-sky-300 font-semibold flex items-center gap-2"
+      </div><!-- end mon section -->
+
+      <!-- ═══ ⚙ 实验配置 ═══ -->
+      <div class="section-bar cfg" @click="sectionOpen.cfg = !sectionOpen.cfg">
+        <span class="chevron" :class="{ open: sectionOpen.cfg }">▶</span>
+        ⚙ 实验配置
+        <span class="count">
+          <span class="kbd">{{ strategyPoolLabel }}</span>
+          <span v-if="snap?.session?.active" class="text-amber-300 ml-2">已锁定</span>
+        </span>
+      </div>
+
+      <div v-show="sectionOpen.cfg" class="space-y-6">
+
+      <div class="card cfg p-5" v-if="snap && strategies.length">
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <h3 class="text-purple-300">
+            声音策略
+            <span v-if="rotationActive" class="text-xs font-normal dim">
+              · 单夜轮播 (每 {{ fmt(strategyRotationMin, 0) }} 分钟换一种)</span>
+            <span v-else-if="strategyPool.length === 1" class="text-xs font-normal dim">
+              · 整夜固定一种</span>
+            <span v-else class="text-xs font-normal dim">
+              · 每次触发随机抽</span>
+          </h3>
+          <div class="text-xs dim">当前: <span class="kbd">{{ strategyPoolLabel }}</span></div>
+        </div>
+
+        <!-- Live rotation progress (only when rotation enabled & active) -->
+        <div v-if="rotationActive && rotationState"
+             class="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/10 p-3 text-sm">
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <span class="dim">当前正播</span>
+              <span class="kbd ml-1">{{ rotationState.current }}</span>
+              <span class="dim ml-2">→ 下一个</span>
+              <span class="kbd ml-1">{{ rotationState.next }}</span>
+            </div>
+            <div class="font-mono text-xs dim">
+              本段已 {{ secToClock(rotationState.time_in_block_s) }}
+              · 还剩 {{ secToClock(rotationState.time_until_next_s) }} 切换
+            </div>
+          </div>
+          <div class="progress trigger mt-2"><div
+            :style="{ width: ((rotationState.time_in_block_s /
+                                 (rotationState.rotation_s || 1)) * 100).toFixed(1) + '%' }"></div></div>
+          <div class="text-xs dim mt-1">
+            会话已运行 {{ secToClock(rotationState.session_elapsed_s) }}
+            · 完整一轮 {{ secToClock(rotationState.rotation_s * rotationState.pool.length) }}
+          </div>
+        </div>
+
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-2">
+          <button v-for="s in strategies" :key="'pool-'+s.key"
+                  class="strat-btn text-left"
+                  :class="{ active: strategyPool.includes(s.key) }"
+                  :disabled="snap?.session?.active"
+                  @click="togglePoolStrategy(s.key)">
+            <div class="flex items-center gap-2">
+              <span class="font-mono">
+                {{ strategyPool.includes(s.key) ? '☑' : '☐' }}</span>
+              <span class="font-semibold">{{ s.key }}</span>
+              <span class="text-xs dim">· {{ s.name }}</span>
+              <span v-if="rotationState && rotationState.current === s.key"
+                    class="ml-auto text-xs text-emerald-300">▶ 现在</span>
+            </div>
+            <div class="text-xs dim mt-0.5 ml-6">{{ s.description }}</div>
+          </button>
+        </div>
+
+        <div class="mt-4 flex items-center gap-3 flex-wrap">
+          <div class="text-xs dim">轮播间隔 (分钟, 0 = 不轮播随机抽):</div>
+          <select :value="strategyRotationMin"
+                  :disabled="snap?.session?.active"
+                  @change="setRotationMinutes(parseFloat($event.target.value))"
+                  class="text-sm">
+            <option :value="0">0 · 不轮播 (随机)</option>
+            <option :value="15">15 分钟</option>
+            <option :value="30">30 分钟</option>
+            <option :value="45">45 分钟</option>
+            <option :value="60">60 分钟</option>
+            <option :value="90">90 分钟</option>
+            <option :value="120">120 分钟</option>
+          </select>
+          <div v-if="rotationActive && strategyPool.length >= 2"
+               class="text-xs dim">
+            一轮总长 ≈
+            <span class="kbd">{{
+              fmt(strategyRotationMin * strategyPool.length, 0) }} 分钟</span>
+          </div>
+          <div v-else-if="strategyRotationMin > 0 && strategyPool.length < 2"
+               class="text-xs text-amber-300">
+            轮播需要至少 2 个策略才会启用
+          </div>
+        </div>
+      </div>
+
+      <div class="card cfg p-5" v-if="snap">
+        <h3 class="text-purple-300">自动干预设置</h3>
+        <p class="text-xs dim mt-1">
+          根据姿态自动播放干预声音。
+        </p>
+
+        <div class="mt-4 grid md:grid-cols-3 gap-3">
+          <label class="p-3 rounded-lg border border-slate-700/50 bg-slate-900/30">
+            <div class="text-xs dim mb-2">自动干预</div>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" :checked="snap.controller.config.enabled"
+                     @change="applyCtrlCfg({enabled: $event.target.checked})">
+              <span class="text-sm">
+                {{ snap.controller.config.enabled ? '已开启' : '已关闭' }}
+              </span>
+            </div>
+          </label>
+
+          <div class="p-3 rounded-lg border border-slate-700/50 bg-slate-900/30 md:col-span-2">
+            <div class="text-xs dim mb-2">灵敏度</div>
+            <div class="grid sm:grid-cols-3 gap-2">
+              <button class="strat-btn text-left"
+                      @click="applyCtrlCfg({trigger_hold_s: 30, response_window_s: 20, cooldown_s: 240, cooldown_no_response_s: 30, retry_trigger_hold_s: 15})">
+                <div class="font-semibold">保守</div>
+                <div class="text-xs dim">少打扰, 适合正式睡眠</div>
+              </button>
+              <button class="strat-btn text-left"
+                      @click="applyCtrlCfg({trigger_hold_s: 15, response_window_s: 15, cooldown_s: 180, cooldown_no_response_s: 8, retry_trigger_hold_s: 5})">
+                <div class="font-semibold">标准</div>
+                <div class="text-xs dim">默认实验设置</div>
+              </button>
+              <button class="strat-btn text-left"
+                      @click="applyCtrlCfg({trigger_hold_s: 8, response_window_s: 10, cooldown_s: 90, cooldown_no_response_s: 5, retry_trigger_hold_s: 2})">
+                <div class="font-semibold">积极</div>
+                <div class="text-xs dim">更快重试, 更容易吵醒</div>
+              </button>
+            </div>
+          </div>
+
+          <label class="md:col-span-3 p-3 rounded-lg border border-slate-700/50 bg-slate-900/30">
+            <div class="flex items-center justify-between text-sm">
+              <span>声音大小</span>
+              <span class="font-mono">{{ fmt(snap.controller.config.level_db, 0) }} dB</span>
+            </div>
+            <input type="range" min="-40" max="-3" step="1"
+                   :value="snap.controller.config.level_db"
+                   @change="applyCtrlCfg({level_db: parseFloat($event.target.value)})"
+                   class="w-full mt-2">
+            <div class="text-xs dim mt-1">越接近 0 越响; 先从 -15 dB 左右开始。</div>
+          </label>
+        </div>
+
+        <button class="mt-4 text-xs text-purple-300/80 flex items-center gap-1.5"
                 @click="showCtrlCfg=!showCtrlCfg">
           <span>{{ showCtrlCfg ? '▾' : '▸' }}</span>
-          控制器阈值  (8s 触发 · 10s 观察 · 180s/5s 冷却)
+          高级参数 (一般不用动)
         </button>
-        <div v-if="showCtrlCfg && snap" class="mt-4 grid md:grid-cols-2 gap-4">
+        <div v-if="showCtrlCfg && snap" class="mt-4 grid sm:grid-cols-2 gap-4">
+          <div class="sm:col-span-2 overflow-x-auto rounded-lg border border-slate-700/40">
+            <table class="vt">
+              <thead>
+                <tr><th>步骤</th><th>用到的参数</th><th>含义</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>1. 识别姿态</td>
+                  <td>姿态切换防抖</td>
+                  <td>姿态必须稳定一小段时间才算切换，避免翻身抖动造成误判。</td>
+                </tr>
+                <tr>
+                  <td>2. 等待触发</td>
+                  <td>仰卧多久才触发</td>
+                  <td>持续仰卧达到这个时长后，才准备播放声音。</td>
+                </tr>
+                <tr v-if="!isSimpleMode">
+                  <td>3. 确认鼾声</td>
+                  <td>最近有过打鼾窗口 / 额外确认鼾声次数</td>
+                  <td>A 模式才使用；S 模式不看鼾声。</td>
+                </tr>
+                <tr>
+                  <td>4. 播放后观察</td>
+                  <td>播完观察多久看翻身</td>
+                  <td>声音播放后，在这个时间内判断姿态是否离开仰卧。</td>
+                </tr>
+                <tr>
+                  <td>5. 进入冷却</td>
+                  <td>翻身成功后冷却 / 无反应后重试冷却</td>
+                  <td>成功翻身就休息更久；没反应就短暂停顿后重试。</td>
+                </tr>
+                <tr>
+                  <td>6. 连续重试</td>
+                  <td>连发重试蓄力时长</td>
+                  <td>上一次没反应时，下一次触发可以等得更短。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
           <label class="space-y-1">
-            <div class="text-xs dim">启用自动闭环</div>
-            <input type="checkbox" :checked="snap.controller.config.enabled"
-                   @change="applyCtrlCfg({enabled: $event.target.checked})">
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">需要同时检测到打鼾 (require_snoring)</div>
-            <input type="checkbox" :checked="snap.controller.config.require_snoring"
-                   @change="applyCtrlCfg({require_snoring: $event.target.checked})">
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">仰卧持续 → 触发 (秒)</div>
+            <div class="text-xs dim">仰卧多久才触发</div>
             <input type="range" min="2" max="60" step="0.5"
                    :value="snap.controller.config.trigger_hold_s"
                    @change="applyCtrlCfg({trigger_hold_s: parseFloat($event.target.value)})"
@@ -922,8 +1357,55 @@ const App = {
             <div class="text-xs dim">{{ fmt(snap.controller.config.trigger_hold_s, 1) }} s</div>
           </label>
           <label class="space-y-1">
-            <div class="text-xs dim">"最近有过打鼾"窗口 (秒) ·
-              鼾之间可以空这么久而不清零</div>
+            <div class="text-xs dim">播完观察多久看翻身</div>
+            <input type="range" min="1" max="30" step="1"
+                   :value="snap.controller.config.response_window_s"
+                   @change="applyCtrlCfg({response_window_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">{{ fmt(snap.controller.config.response_window_s, 1) }} s</div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">翻身成功后冷却</div>
+            <input type="range" min="5" max="300" step="5"
+                   :value="snap.controller.config.cooldown_s"
+                   @change="applyCtrlCfg({cooldown_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">{{ fmt(snap.controller.config.cooldown_s, 0) }} s</div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">无反应后重试冷却</div>
+            <input type="range" min="0.5" max="60" step="0.5"
+                   :value="snap.controller.config.cooldown_no_response_s"
+                   @change="applyCtrlCfg({cooldown_no_response_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">{{ fmt(snap.controller.config.cooldown_no_response_s, 1) }} s</div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">连发重试蓄力时长</div>
+            <input type="range" min="0.5" max="30" step="0.5"
+                   :value="snap.controller.config.retry_trigger_hold_s || 2"
+                   @change="applyCtrlCfg({retry_trigger_hold_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">
+              {{ fmt(snap.controller.config.retry_trigger_hold_s, 1) }} s
+              <span v-if="snap.controller.retry_mode" class="text-amber-300">· 当前生效</span>
+            </div>
+          </label>
+          <label class="space-y-1">
+            <div class="text-xs dim">姿态切换防抖</div>
+            <input type="range" min="0.5" max="10" step="0.5"
+                   :value="snap.controller.config.debounce_s"
+                   @change="applyCtrlCfg({debounce_s: parseFloat($event.target.value)})"
+                   class="w-full">
+            <div class="text-xs dim">{{ fmt(snap.controller.config.debounce_s, 1) }} s</div>
+          </label>
+          <label v-if="!isSimpleMode" class="space-y-1">
+            <div class="text-xs dim">需要同时检测到打鼾</div>
+            <input type="checkbox" :checked="snap.controller.config.require_snoring"
+                   @change="applyCtrlCfg({require_snoring: $event.target.checked})">
+          </label>
+          <label v-if="!isSimpleMode" class="space-y-1">
+            <div class="text-xs dim">“最近有过打鼾”窗口</div>
             <input type="range" min="3" max="60" step="1"
                    :value="snap.controller.config.snoring_recent_s"
                    @change="applyCtrlCfg({snoring_recent_s: parseFloat($event.target.value)})"
@@ -934,108 +1416,38 @@ const App = {
                 · 距上次鼾声 {{ fmt(snap.controller.snoring_age_s, 1) }} s</span>
             </div>
           </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">额外确认鼾声次数 (防误触发) ·
-              武装后必须再出现这么多次"打鼾开始"事件才会真正播放</div>
+          <label v-if="!isSimpleMode" class="space-y-1 sm:col-span-2">
+            <div class="text-xs dim">额外确认鼾声次数</div>
             <input type="range" min="0" max="3" step="1"
                    :value="snap.controller.config.confirm_snore_bouts ?? 1"
                    @change="applyCtrlCfg({confirm_snore_bouts: parseInt($event.target.value)})"
                    class="w-full">
             <div class="text-xs dim">
               {{ snap.controller.config.confirm_snore_bouts ?? 1 }} 次
-              <span v-if="snap.controller.state === 'armed'"
-                    class="text-amber-300">
-                · 当前已确认 {{ snap.controller.snore_bouts_since_armed ?? 0 }} 次
-              </span>
-              <span v-else class="dim">
-                · 0 = 关闭 (单次鼾声+8 s 即触发);
-                  推荐 1 (即至少需要 2 次独立鼾声)
+              <span v-if="snap.controller.state === 'armed'" class="text-amber-300">
+                · 已确认 {{ snap.controller.snore_bouts_since_armed ?? 0 }} 次
               </span>
             </div>
           </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">姿态 debounce (秒)</div>
-            <input type="range" min="0.5" max="10" step="0.5"
-                   :value="snap.controller.config.debounce_s"
-                   @change="applyCtrlCfg({debounce_s: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">{{ fmt(snap.controller.config.debounce_s, 1) }} s</div>
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">响应观察窗 (秒) ·
-              播完后盯多久看是否翻身</div>
-            <input type="range" min="1" max="30" step="1"
-                   :value="snap.controller.config.response_window_s"
-                   @change="applyCtrlCfg({response_window_s: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">{{ fmt(snap.controller.config.response_window_s, 1) }} s</div>
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">连发重试武装 (秒) ·
-              无反应后再次蓄力的短时长</div>
-            <input type="range" min="0.5" max="10" step="0.5"
-                   :value="snap.controller.config.retry_trigger_hold_s || 2"
-                   @change="applyCtrlCfg({retry_trigger_hold_s: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">
-              {{ fmt(snap.controller.config.retry_trigger_hold_s, 1) }} s
-              <span v-if="snap.controller.retry_mode" class="text-amber-300">· 正在使用</span>
-              <span v-else class="dim">
-                · 首触发仍按 {{ fmt(snap.controller.config.trigger_hold_s, 0) }} s 蓄力
-              </span>
+          <div class="sm:col-span-2 pt-2 border-t border-slate-700/40">
+            <div class="text-xs dim mb-2">活跃时段 (空白 = 全夜启用)</div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <input type="time" :value="snap.controller.config.active_window_start"
+                     @change="applyCtrlCfg({active_window_start: $event.target.value})">
+              <span class="dim">→</span>
+              <input type="time" :value="snap.controller.config.active_window_end"
+                     @change="applyCtrlCfg({active_window_end: $event.target.value})">
+              <button class="btn ghost text-xs"
+                      @click="applyCtrlCfg({active_window_start:'', active_window_end:''})">
+                清除
+              </button>
             </div>
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">冷却 · 成功后 (秒)</div>
-            <input type="range" min="5" max="300" step="5"
-                   :value="snap.controller.config.cooldown_s"
-                   @change="applyCtrlCfg({cooldown_s: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">{{ fmt(snap.controller.config.cooldown_s, 1) }} s
-              <span class="dim">(被试真翻身后的静默期)</span></div>
-          </label>
-          <label class="space-y-1">
-            <div class="text-xs dim">冷却 · 无反应后 (秒)</div>
-            <input type="range" min="0.5" max="30" step="0.5"
-                   :value="snap.controller.config.cooldown_no_response_s"
-                   @change="applyCtrlCfg({cooldown_no_response_s: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">{{ fmt(snap.controller.config.cooldown_no_response_s, 1) }} s
-              <span class="dim">(观察窗超时 → 短暂静默后再次尝试)</span></div>
-          </label>
-          <div class="md:col-span-2 pt-2 border-t border-slate-700/40">
-            <div class="text-xs text-sky-200/80 mb-2">活跃时段
-              <span class="dim">(估计 N2 深睡期; 空白 = 全程启用)</span></div>
-            <div class="grid grid-cols-2 gap-3">
-              <label class="space-y-1">
-                <div class="text-xs dim">起始 (本地时间)</div>
-                <input type="time" :value="snap.controller.config.active_window_start"
-                       @change="applyCtrlCfg({active_window_start: $event.target.value})"
-                       class="w-full">
-              </label>
-              <label class="space-y-1">
-                <div class="text-xs dim">结束 (可跨午夜, 例 23:00 → 05:30)</div>
-                <input type="time" :value="snap.controller.config.active_window_end"
-                       @change="applyCtrlCfg({active_window_end: $event.target.value})"
-                       class="w-full">
-              </label>
-            </div>
-            <button class="btn mt-2" @click="applyCtrlCfg({active_window_start:'', active_window_end:''})">
-              清除窗口 (全程启用)</button>
           </div>
-          <label class="space-y-1">
-            <div class="text-xs dim">播放响度 (dB)</div>
-            <input type="range" min="-40" max="-3" step="1"
-                   :value="snap.controller.config.level_db"
-                   @change="applyCtrlCfg({level_db: parseFloat($event.target.value)})"
-                   class="w-full">
-            <div class="text-xs dim">{{ fmt(snap.controller.config.level_db, 0) }} dB</div>
-          </label>
         </div>
       </div>
 
-      <div class="card p-5">
-        <button class="text-sky-300 font-semibold flex items-center gap-2"
+      <div class="card cfg p-5" v-if="!isSimpleMode">
+        <button class="text-purple-300 font-semibold flex items-center gap-2"
                 @click="showSnoreCfg=!showSnoreCfg">
           <span>{{ showSnoreCfg ? '▾' : '▸' }}</span>
           鼾声检测阈值  (YAMNet)
@@ -1067,11 +1479,23 @@ const App = {
         </div>
       </div>
 
-      <div class="card p-5">
-        <h3 class="text-sky-300">事件时间线</h3>
-        <pre class="timeline mt-3" v-if="snap && snap.events_tail.length"
-            >{{ snap.events_tail.join('\\n') }}</pre>
-        <div v-else class="mt-3 text-sm dim">(会话开始后显示)</div>
+      </div><!-- end cfg section -->
+
+      <!-- ═══ 📋 日志 ═══ -->
+      <div class="section-bar log" @click="sectionOpen.log = !sectionOpen.log">
+        <span class="chevron" :class="{ open: sectionOpen.log }">▶</span>
+        📋 日志
+        <span class="count" v-if="snap?.events_tail?.length">
+          {{ snap.events_tail.length }} 条事件
+        </span>
+      </div>
+
+      <div v-show="sectionOpen.log" class="space-y-6">
+        <div class="card log p-5">
+          <pre v-if="snap && snap.events_tail.length"
+               class="timeline">{{ snap.events_tail.slice(-30).join('\\n') }}</pre>
+          <div v-else class="text-sm dim">(会话开始后显示)</div>
+        </div>
       </div>
     </section>
 
@@ -1125,9 +1549,53 @@ const App = {
               <input type="checkbox" v-model="chestScan.chestbandOnly">
               <span>仅胸带 (HSR/1A2/SRG…)</span></label>
           </div>
-          <div class="flex gap-2">
+          <div class="flex gap-2 flex-wrap">
             <button class="btn success" @click="chestConnectGo">连接</button>
             <button class="btn danger" @click="chestDisconnectGo">断开</button>
+            <button class="btn" @click="chestResyncRTC"
+                    :disabled="!isConnectedChest"
+                    title="重发 RTC 同步, 清 device_status bit 6, 是唯一对蜂鸣有效的命令">
+              🔕 静音蜂鸣
+            </button>
+            <button class="btn ghost text-xs" @click="showChestDiag = !showChestDiag">
+              {{ showChestDiag ? '收起' : '高级诊断' }}
+            </button>
+          </div>
+
+          <!-- 高级诊断 (默认折起): device_status 解码 + 解绑外设按钮 -->
+          <div v-if="showChestDiag" class="mt-3 space-y-3 text-sm">
+            <div v-if="snap?.chestband?.vitals?.device_status"
+                 class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10">
+              <div class="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <span class="dim">device_status =</span>
+                  <span class="kbd ml-1 font-mono">0x{{
+                    snap.chestband.vitals.device_status.raw
+                      .toString(16).padStart(2,'0').toUpperCase() }}</span>
+                </div>
+                <div v-if="!snap.chestband.vitals.device_status.flags.length"
+                     class="text-emerald-300">无告警</div>
+              </div>
+              <div v-if="snap.chestband.vitals.device_status.flags.length"
+                   class="mt-2 flex flex-wrap gap-1.5">
+                <span v-for="f in snap.chestband.vitals.device_status.flags"
+                      :key="f.bit"
+                      class="badge"
+                      :class="(f.bit === 0 || f.bit === 1) ? 'err' : 'warn'">
+                  bit{{ f.bit }} · {{ f.label }}
+                </span>
+              </div>
+            </div>
+            <div class="flex gap-2 flex-wrap">
+              <button class="btn ghost text-xs" @click="chestUnbindAll"
+                      :disabled="!isConnectedChest">解绑全部外设</button>
+              <button class="btn ghost text-xs" @click="chestSilenceGo"
+                      :disabled="!isConnectedChest">发 0x0B (实测无效)</button>
+            </div>
+            <p class="text-xs dim">
+              重发 RTC 是协议里唯一被实测验证有效的"静音"命令. HSRG 固件不响应
+              0x0B 状态控制帧. 解绑外设会清 PC-68B 绑定 — 想恢复请重启胸带.
+            </p>
           </div>
           <table class="vt mt-3" v-if="snap">
             <thead><tr>

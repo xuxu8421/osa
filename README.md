@@ -38,6 +38,12 @@
   L1/L2（居中短声，留给后续 Block B 截断鼾声）。
 - **完整状态机**：仰卧 ∧ 最近有鼾声 → 计时 8 秒 → 触发 → 播放 → 10 秒观察 →
   成功 180 秒长冷却 / 无反应 5 秒短冷却（全部可调）。
+- **两种实验模式**：
+  - `A · 仰卧 + 鼾声`（Block A · 完整版，需要 PC-68B 血氧 + Mac 麦克风）
+  - `S · 仅姿态`（简化版，**只用胸带 + 耳机**，触发条件退化为仅仰卧持续 N 秒，
+    详见 [`docs/mode_s_posture_only.md`](docs/mode_s_posture_only.md)）
+
+  Web UI 顶栏一键切换。
 - **活跃时段**：一整夜不可能一直干预，支持指定起止时间（例如 `01:00–04:30`）。
 - **每次触发自动落盘**：胸带呼吸波 ±30 s、SpO2 ±60 s、YAMNet 概率 ±30 s、
   麦克风 ±10 s 录音、当次播放的干预音副本，方便事后审核。
@@ -79,6 +85,7 @@ osa-rig/
 ├── docs/                      设计与协议文档（给 reviewer 看）
 │   ├── architecture.md        系统总览 & 线程/数据流模型
 │   ├── block_a_pipeline.md    Block A 状态机 & 时间轴示例
+│   ├── mode_s_posture_only.md S 模式 (仅姿态干预) 设计 & 默认参数
 │   ├── snore_detection.md     YAMNet 后端 & 调参
 │   ├── sound_strategies.md    5 种声学策略 & 合成参数
 │   ├── data_format.md         sessions/<id>/ 里每个文件是什么

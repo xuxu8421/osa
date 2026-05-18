@@ -106,6 +106,78 @@ def build_rtc_set(device_id: bytes) -> bytes:
     return _build_packet(device_id, FT_RTC_SET, payload)
 
 
+def build_peripheral_unbind(device_id: bytes,
+                            peripheral_type: int = 0x01) -> bytes:
+    """Build a 0x0D BT-peripheral-unbind packet (ProtocolDoc §5.6).
+
+    peripheral_type: 0x00 thermometer, 0x01 pulse-oximeter (PC-68B),
+                     0x02 BP cuff, 0x03 spirometer.
+
+    We send action=0x01 ("下发 MAC") with all-zero MAC, which most
+    HSR-style firmwares interpret as "unbind / forget this peripheral".
+    Useful when the chest band is beeping because it can't see its
+    paired PC-68B and we want it to stop caring.
+    """
+    payload = bytearray()
+    payload.append(0x01)               # action = 下发 MAC
+    payload.append(peripheral_type & 0xFF)
+    payload += b'\x00' * 6             # MAC = 00:00:00:00:00:00
+    return _build_packet(device_id, FT_BLE_CTRL, bytes(payload))
+
+
+def build_status_ctrl(device_id: bytes, switches: int = 0x00,
+                      b10: int = 0x00, b11: int = 0x00,
+                      b12: int = 0x00) -> bytes:
+    """Build a 0x0B "status indicator switches" packet.
+
+    Per 1A2.0 protocol §5.5 the documented payload is one byte (the
+    `switches` bitfield) followed by three reserved 0x00 bytes. In
+    practice firmwares often stuff vendor-specific bits into those
+    "reserved" bytes, so we expose them as parameters too — useful when
+    bit-scanning to find an undocumented "silence" toggle.
+
+    Documented bit layout of `switches` (§5.5 has noisy labels):
+      bit 0: BT-disconnect blue-LED flash
+      bit 1: thermometer-disconnect blue-LED flash
+      bit 2: low-battery green-LED flash
+      bit 3: low-battery vibration
+      bit 4: thermometer low-battery green-LED
+      bit 5: BT thermometer enable
+      bit 6: BT pulse-oximeter enable  (keep =1 to retain PC-68B relay)
+      bit 7: BT BP-meter enable
+    """
+    payload = bytearray()
+    payload.append(switches & 0xFF)
+    payload.append(b10 & 0xFF)
+    payload.append(b11 & 0xFF)
+    payload.append(b12 & 0xFF)
+    return _build_packet(device_id, FT_STATUS_CTRL, bytes(payload))
+
+
+# device_status (byte 170 of sub-packet 2) bit definitions, per §6.1
+# protocol doc.  bit value 1 = alert / true.
+DEVICE_STATUS_BITS = [
+    (0, '心电导联脱落'),
+    (1, '血氧探头脱落'),
+    (2, '体温连接断'),
+    (3, '血氧连接断'),
+    (4, '血压连接断'),
+    (5, '流速仪连接断'),
+    (6, '时间设置标志'),
+    (7, '开机标志'),
+]
+
+
+def decode_device_status(byte_val: int) -> dict:
+    """Decode the 8-bit `device_status` field into a flag dict so the
+    UI can pinpoint which alert source is currently active."""
+    out = {'raw': int(byte_val) & 0xFF, 'flags': []}
+    for bit, label in DEVICE_STATUS_BITS:
+        if (byte_val >> bit) & 1:
+            out['flags'].append({'bit': bit, 'label': label})
+    return out
+
+
 def _build_packet(device_id: bytes, frame_type: int, payload: bytes) -> bytes:
     did = device_id[:4].ljust(4, b'\x00')
     length = 2 + 4 + 1 + len(payload) + 1  # len_field + did + type + payload + checksum
@@ -126,6 +198,10 @@ class PacketParser:
         self._assembler: dict[int, DataPacket] = {}  # packet_sn -> DataPacket
         self.on_registration: Optional[Callable] = None
         self.on_data: Optional[Callable[[DataPacket], None]] = None
+        # Most recent 4-byte device-ID seen on the wire. Required for
+        # crafting any host-to-device control packet (RTC set, status
+        # ctrl, etc.) since the protocol echoes DID in every frame.
+        self.last_did_bytes: Optional[bytes] = None
 
     def feed(self, data: bytes):
         """Feed raw bytes from BLE notification. Parses all complete packets."""
@@ -156,6 +232,7 @@ class PacketParser:
 
     def _handle_packet(self, pkt: bytes):
         did = struct.unpack('>I', pkt[4:8])[0]
+        self.last_did_bytes = pkt[4:8]
         ft = pkt[8]
 
         if ft == FT_REGISTER_REQ:

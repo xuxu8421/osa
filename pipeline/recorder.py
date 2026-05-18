@@ -113,6 +113,11 @@ class SessionRecorder:
             bus.subscribe('intervention.state', self._on_generic),
             bus.subscribe('intervention.response', self._on_generic),
             bus.subscribe('snore.state', self._on_generic),
+            # BLE link-state changes — needed to know when chestband
+            # silently dropped vs reconnected during a multi-hour run.
+            # Without these, an outage looks like "data just stopped".
+            bus.subscribe('chestband.disconnect', self._on_generic),
+            bus.subscribe('chestband.reconnected', self._on_generic),
         ]
 
         # Background flusher
